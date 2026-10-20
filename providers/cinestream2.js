@@ -1,15 +1,15 @@
 // =============================================================================
 //  cinestream2.js — CineStream2 provider for Zangetsu (QuickJS-NG)
 //
-//  v1.0.2 — SPEED RELEASE
-//    • Removed slowest providers: Moviebox, Showbox, Castle
-//    • Parallelised server loops in Videasy, Cinejoy, Meowtv, Peachify,
-//      VidFastPro, Vidcore, Vidup, Vidrock
-//    • Added withTimeout per-provider (1500ms) + global (2500ms)
-//    • Lazy Cinemeta (700ms) — no longer blocks non-title providers
-//    • Registry reordered fastest-first
+//  v1.0.3 — META-RESOLUTION FIX + SHOWBOX RESTORED
+//    • New _resolveMeta(): Cinemeta + TMDB /find in parallel + TMDB detail fallback
+//    • All tmdbId/title-dependent providers now correctly await the shared meta
+//    • metaPromise cap: 700ms → 1500ms (real-world networks complete)
+//    • Showbox restored (1 attempt, 800ms/request, 2200ms total)
+//    • Fixed Cinejoy double-fetch bug
 //
-//  v1.0.1 — fixed tmdb:// scheme, videoId, moviedb_id, TMDB path
+//  v1.0.2 — SPEED RELEASE (removed Moviebox, Castle; parallelised servers)
+//  v1.0.1 — tmdb:// scheme, videoId, moviedb_id, TMDB path fix
 //  v1.0.0 — initial port
 // =============================================================================
 
@@ -29,11 +29,12 @@ var MULTI_DECRYPT_API   = 'https://enc-dec.app/api';
 var WYZIE_SUBS_API      = 'https://sub.wyzie.io';
 var PLAYER_UA           = 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36';
 
-// Global speed envelope
-var CINEMETA_TIMEOUT    = 700;   // ms — Cinemeta fetch cap
-var PROVIDER_TIMEOUT    = 1500;  // ms — per-provider cap
-var ADDON_TIMEOUT       = 1800;  // ms — per-addon cap
-var GLOBAL_TIMEOUT      = 2500;  // ms — total budget
+// Speed envelope
+var META_TIMEOUT     = 1500;   // ms — Cinemeta + TMDB find + TMDB detail (all wrapped together)
+var PROVIDER_TIMEOUT = 1000;   // ms — per-provider default
+var SHOWBOX_TIMEOUT  = 2200;   // ms — Showbox is slower but user asked for it
+var ADDON_TIMEOUT    = 1800;   // ms — per-addon
+var GLOBAL_TIMEOUT   = 3000;   // ms — total budget
 
 var API = {
   vidlink:      'https://vidlink.pro',
@@ -49,7 +50,9 @@ var API = {
   peachify:     'https://x.eat-peach.sbs',
   peachifyBase: 'https://peachify.top',
   cinejoy:      'https://api.shegu.st',
-  cinejoyBase:  'https://cinejoy.to'
+  cinejoyBase:  'https://cinejoy.to',
+  showbox:      'https://showbox.media',
+  febbox:       'https://www.febbox.com'
 };
 
 // =============================================================================
@@ -62,7 +65,7 @@ function getInfo() {
     baseUrl: 'https://www.themoviedb.org',
     logo: 'https://www.google.com/s2/favicons?sz=256&domain=strem.io',
     type: 'movie',
-    version: '1.0.2'
+    version: '1.0.3'
   };
 }
 
@@ -76,6 +79,9 @@ function getSettings() {
       type: 'text', default: '' },
     { key: 'wyzieSubsKey', label: 'Wyzie Subs API Key',
       description: 'Optional. Enables the Wyzie subtitle provider.',
+      type: 'text', default: '' },
+    { key: 'showboxToken', label: 'Showbox (Febbox) UI Token',
+      description: 'Febbox UI token. Required to enable Showbox.',
       type: 'text', default: '' },
     { key: 'allowDownloadLinks', label: 'Show download-only links',
       description: 'Include sources labelled "Download" and video.googleusercontent links.',
@@ -120,13 +126,14 @@ function _combinedSettings() {
     tmdbKey:       _trim(_readSetting('tmdbApiKey')),
     addons:        _parseAddonUrls(_readSetting('addonUrls')),
     wyzieKey:      _trim(_readSetting('wyzieSubsKey')),
+    showboxToken:  _trim(_readSetting('showboxToken')),
     allowDownload: _bool('allowDownloadLinks', false),
     maxPerAddon:   Math.min(_num('maxStreamsPerAddon', 25), 100)
   };
 }
 
 // =============================================================================
-//  TIMEOUT HELPER — the key ingredient for the 3-second target
+//  TIMEOUT
 // =============================================================================
 function withTimeout(promise, ms, fallback) {
   var fb = fallback === undefined ? [] : fallback;
@@ -137,7 +144,7 @@ function withTimeout(promise, ms, fallback) {
 }
 
 // =============================================================================
-//  BYTE HELPERS
+//  BYTES / CRYPTO
 // =============================================================================
 function _strToBytes(s) { return new TextEncoder().encode(String(s)); }
 function _bytesToStr(b) { return new TextDecoder().decode(b); }
@@ -162,10 +169,6 @@ function _b64urlToBytes(s) {
 function _bytesToB64url(b) {
   return _bytesToB64(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
-
-// =============================================================================
-//  CRYPTO
-// =============================================================================
 async function _importAesCbc(rawKey) {
   return await crypto.subtle.importKey('raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt', 'encrypt']);
 }
@@ -293,21 +296,31 @@ function _tmdbJson(path) {
   var cfg = _combinedSettings();
   var headers = { Accept: 'application/json' };
   if (cfg.tmdbKey) headers.Host = 'api.themoviedb.org';
-  return _fetch(_tmdbPath(path), { headers: headers, timeoutMs: 8000 })
+  return _fetch(_tmdbPath(path), { headers: headers, timeoutMs: 6000 })
     .catch(function (e) { console.warn('TMDB fail', path, e); return null; });
 }
 function _tmdbImage(path, size) {
   if (!path) return null;
   return TMDB_IMG + '/' + (size || 'w500') + path;
 }
+function _tmdbFind(imdbId) {
+  return _tmdbJson('/find/' + imdbId + '?external_source=imdb_id')
+    .then(function (json) {
+      if (!json) return null;
+      if (json.movie_results && json.movie_results.length) return json.movie_results[0].id;
+      if (json.tv_results && json.tv_results.length) return json.tv_results[0].id;
+      return null;
+    })
+    .catch(function () { return null; });
+}
 function _cinemetaMeta(type, imdbId) {
-  return _fetch(CINEMETA + '/meta/' + type + '/' + imdbId + '.json', { timeoutMs: 6000 })
+  return _fetch(CINEMETA + '/meta/' + type + '/' + imdbId + '.json', { timeoutMs: 5000 })
     .then(function (j) { return j && j.meta ? j.meta : null; })
     .catch(function () { return null; });
 }
 function _kitsuMeta(kitsuId) {
   var id = String(kitsuId).replace(':', '%3A');
-  return _fetch(KITSU + '/meta/series/' + id + '.json', { timeoutMs: 6000 })
+  return _fetch(KITSU + '/meta/series/' + id + '.json', { timeoutMs: 5000 })
     .then(function (j) { return j && j.meta ? j.meta : null; })
     .catch(function () { return null; });
 }
@@ -324,6 +337,42 @@ function _enrichFromAioMetadata(type, imdbId) {
         .catch(function () { return null; });
     })
     .then(function (j) { return j && j.meta ? j.meta : null; });
+}
+
+// =============================================================================
+//  ★ NEW — META RESOLVER (the fix for "only VaPlayer works")
+// =============================================================================
+async function _resolveMeta(imdbId, tmdbId, type) {
+  // type is 'movie' or 'tv' (the TMDB identifier)
+  var result = { title: null, year: null, tmdbId: tmdbId || null };
+
+  var cmetaJob = imdbId ? _cinemetaMeta(type === 'tv' ? 'series' : 'movie', imdbId) : Promise.resolve(null);
+  var findJob  = (imdbId && !tmdbId) ? _tmdbFind(imdbId) : Promise.resolve(tmdbId || null);
+
+  var r = await Promise.all([cmetaJob, findJob]);
+  var cmeta = r[0];
+  var found = r[1];
+
+  if (cmeta) {
+    result.title = cmeta.name || (cmeta.aliases && cmeta.aliases[0]) || null;
+    result.year = _year(cmeta);
+    if (!result.tmdbId && cmeta.moviedb_id) result.tmdbId = cmeta.moviedb_id;
+  }
+  if (!result.tmdbId && found) result.tmdbId = found;
+
+  // Last resort: TMDB detail for title
+  if (!result.title && result.tmdbId) {
+    try {
+      var info = await _tmdbJson('/' + type + '/' + result.tmdbId);
+      if (info) {
+        result.title = info.title || info.name || null;
+        if (!result.year) result.year = (info.release_date || info.first_air_date || '').slice(0, 4) || null;
+      }
+    } catch (e) {}
+  }
+
+  console.log('CineStream2 meta:', JSON.stringify(result));
+  return result;
 }
 
 // =============================================================================
@@ -813,10 +862,10 @@ function _invokeWyzieSubs(imdbId, season, episode, subtitleCb) {
 }
 
 // =============================================================================
-//  PROVIDERS — PARALLELISED
+//  PROVIDERS
 // =============================================================================
 
-// ── 1. VaPlayer (fastest) ──────────────────────────────────────────────
+// VaPlayer — imdbId only, no meta needed
 async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
   if (!imdbId) return [];
   var referer = 'https://nextgencloudfabric.com/';
@@ -824,7 +873,7 @@ async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
     ? API.vaplayer + '/api.php?imdb=' + imdbId + '&type=movie'
     : API.vaplayer + '/api.php?imdb=' + imdbId + '&type=tv&season=' + season + '&episode=' + episode;
   try {
-    var res = JSON.parse(await _getText(url, { Referer: referer }, 6000));
+    var res = JSON.parse(await _getText(url, { Referer: referer }, 5000));
     var out = [];
     ((res && res.data && res.data.stream_urls) || []).forEach(function (u) {
       if (!u) return;
@@ -843,18 +892,18 @@ async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 2. Vidlink ─────────────────────────────────────────────────────────
+// Vidlink
 async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   try {
-    var parsed = JSON.parse(await _getText(MULTI_DECRYPT_API + '/enc-vidlink?text=' + tmdbId, {}, 6000));
+    var parsed = JSON.parse(await _getText(MULTI_DECRYPT_API + '/enc-vidlink?text=' + tmdbId, {}, 5000));
     var payload = parsed && parsed.result;
     if (!payload) return [];
     var headers = { 'User-Agent': PLAYER_UA, Referer: API.vidlink + '/', Origin: API.vidlink };
     var epUrl = season == null
       ? API.vidlink + '/api/b/movie/' + payload
       : API.vidlink + '/api/b/tv/' + payload + '/' + season + '/' + episode;
-    var stream = JSON.parse(await _getText(epUrl, headers, 6000)).stream;
+    var stream = JSON.parse(await _getText(epUrl, headers, 5000)).stream;
     if (!stream) return [];
     var out = [];
     Object.keys(stream.qualities || {}).forEach(function (k) {
@@ -875,14 +924,14 @@ async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 3. Vidrock ─────────────────────────────────────────────────────────
+// Vidrock
 async function _invokeVidrock(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var type = season == null ? 'movie' : 'tv';
   var query = season == null ? String(tmdbId) : tmdbId + '_' + season + '_' + episode;
   var headers = { Origin: API.vidrock, Referer: API.vidrock + '/', 'User-Agent': PLAYER_UA };
   try {
-    var data = JSON.parse(await _getText(API.vidrock + '/api/' + type + '/' + query + '/', headers, 6000));
+    var data = JSON.parse(await _getText(API.vidrock + '/api/' + type + '/' + query + '/', headers, 5000));
     var keys = Object.keys(data);
     var decrypted = await Promise.all(keys.map(async function (key) {
       var encUrl = data[key] && data[key].url;
@@ -899,7 +948,7 @@ async function _invokeVidrock(tmdbId, season, episode) {
   } catch (e) { return []; }
 }
 
-// ── 4. Peachify (parallel servers) ─────────────────────────────────────
+// Peachify
 async function _invokePeachify(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var headers = {
@@ -912,7 +961,7 @@ async function _invokePeachify(tmdbId, season, episode) {
       var url = season == null
         ? API.peachify + '/' + server + '/movie/' + tmdbId
         : API.peachify + '/' + server + '/tv/' + tmdbId + '/' + season + '/' + episode;
-      var encrypt = JSON.parse(await _getText(url, headers, 6000)).data;
+      var encrypt = JSON.parse(await _getText(url, headers, 5000)).data;
       if (!encrypt) return [];
       var decrypted = await peachifyDecrypt(encrypt);
       if (!decrypted) return [];
@@ -951,7 +1000,7 @@ async function _invokePeachify(tmdbId, season, episode) {
   return out;
 }
 
-// ── 5. Meowtv (parallel servers) ───────────────────────────────────────
+// Meowtv
 async function _invokeMeowtv(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var servers = ['ipcloud', 'dcloud', 'tik', 'turkce', 'hindiv3'];
@@ -962,10 +1011,10 @@ async function _invokeMeowtv(tmdbId, season, episode) {
       var url = API.meowtv + '/streams/' + type + '/' + tmdbId;
       if (season != null) url += '/' + season + '/' + episode;
       url += '?s=' + server;
-      var json = JSON.parse(await _getText(url, headers, 6000));
+      var json = JSON.parse(await _getText(url, headers, 5000));
       var dec = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-meowtv', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: json }), timeoutMs: 6000
+        body: JSON.stringify({ data: json }), timeoutMs: 5000
       }));
       var r = dec && dec.result;
       if (!r || !r.url) return [];
@@ -982,7 +1031,7 @@ async function _invokeMeowtv(tmdbId, season, episode) {
   return out;
 }
 
-// ── 6. VidFastPro (parallel servers) ───────────────────────────────────
+// VidFastPro
 async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var base = API.vidfast;
@@ -991,30 +1040,28 @@ async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
     : base + '/tv/' + tmdbId + '/' + season + '/' + episode + '/';
   var headers = { 'User-Agent': PLAYER_UA, Referer: base + '/' };
   try {
-    var html = await _getText(url, headers, 6000);
+    var html = await _getText(url, headers, 5000);
     var m = html.match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
     if (!m) return [];
     var parsed = JSON.parse(await _getText(
-      MULTI_DECRYPT_API + '/enc-vidfast?text=' + encodeURIComponent(m[1]), {}, 6000));
+      MULTI_DECRYPT_API + '/enc-vidfast?text=' + encodeURIComponent(m[1]), {}, 5000));
     var result = parsed && parsed.result;
     if (!result || !result.servers || !result.stream || !result.token) return [];
     var postHeaders = Object.assign({}, headers, { 'X-CSRF-Token': result.token });
-    var serversEnc = await _fetchText(result.servers, { method: 'POST', headers: postHeaders, timeoutMs: 6000 });
+    var serversEnc = await _fetchText(result.servers, { method: 'POST', headers: postHeaders, timeoutMs: 5000 });
     var dec = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidfast', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: serversEnc }), timeoutMs: 6000
+      body: JSON.stringify({ text: serversEnc }), timeoutMs: 5000
     }));
     var servers = (dec && dec.result) || [];
-
-    // PARALLEL across servers
     var serverResults = await Promise.all(servers.map(async function (srv) {
       if (!srv || !srv.data) return [];
       try {
         var streamEnc = await _fetchText(result.stream + '/' + srv.data,
-          { method: 'POST', headers: postHeaders, timeoutMs: 6000 });
+          { method: 'POST', headers: postHeaders, timeoutMs: 5000 });
         var final = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidfast', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: streamEnc }), timeoutMs: 6000
+          body: JSON.stringify({ text: streamEnc }), timeoutMs: 5000
         }));
         var r = final && final.result;
         if (!r || !r.url) return [];
@@ -1036,7 +1083,7 @@ async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 7. Vidcore (parallel servers) ──────────────────────────────────────
+// Vidcore
 async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var headers = { 'User-Agent': PLAYER_UA, Referer: API.vidcore + '/', 'X-Requested-With': 'XMLHttpRequest' };
@@ -1044,25 +1091,25 @@ async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
     ? API.vidcore + '/movie/' + tmdbId
     : API.vidcore + '/tv/' + tmdbId + '/' + season + '/' + episode;
   try {
-    var encM = (await _getText(baseUrl, {}, 6000)).match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
+    var encM = (await _getText(baseUrl, {}, 5000)).match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
     if (!encM) return [];
     var init = JSON.parse(await _getText(
-      MULTI_DECRYPT_API + '/enc-vidcore?text=' + encodeURIComponent(encM[1]), {}, 6000)).result;
+      MULTI_DECRYPT_API + '/enc-vidcore?text=' + encodeURIComponent(encM[1]), {}, 5000)).result;
     if (!init) return [];
     headers['X-CSRF-Token'] = init.token;
-    var serversEnc = await _fetchText(init.servers, { method: 'POST', headers: headers, timeoutMs: 6000 });
+    var serversEnc = await _fetchText(init.servers, { method: 'POST', headers: headers, timeoutMs: 5000 });
     var serversList = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidcore', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: serversEnc }), timeoutMs: 6000
+      body: JSON.stringify({ text: serversEnc }), timeoutMs: 5000
     })).result || [];
 
     var serverResults = await Promise.all(serversList.map(async function (srv) {
       try {
         var streamEnc = await _fetchText(init.stream + '/' + srv.data,
-          { method: 'POST', headers: headers, timeoutMs: 6000 });
+          { method: 'POST', headers: headers, timeoutMs: 5000 });
         var decStream = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidcore', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: streamEnc }), timeoutMs: 6000
+          body: JSON.stringify({ text: streamEnc }), timeoutMs: 5000
         })).result;
         if (!decStream || !decStream.url) return [];
         (decStream.tracks || []).forEach(function (t) {
@@ -1082,7 +1129,7 @@ async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 8. Vidup (parallel servers) ────────────────────────────────────────
+// Vidup
 async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var headers = { 'User-Agent': PLAYER_UA, Referer: API.vidup + '/', 'X-Requested-With': 'XMLHttpRequest' };
@@ -1090,27 +1137,27 @@ async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
     ? API.vidup + '/tv/' + tmdbId + '/' + season + '/' + episode
     : API.vidup + '/movie/' + tmdbId;
   try {
-    var encM = (await _getText(url, {}, 6000)).match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
+    var encM = (await _getText(url, {}, 5000)).match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
     if (!encM) return [];
     var parsed = JSON.parse(await _getText(
-      MULTI_DECRYPT_API + '/enc-vidup?text=' + encM[1], headers, 6000));
+      MULTI_DECRYPT_API + '/enc-vidup?text=' + encM[1], headers, 5000));
     if (parsed.status !== 200 || !parsed.result) return [];
     var result = parsed.result;
     var postHeaders = Object.assign({}, headers, { 'X-CSRF-Token': result.token });
-    var serversEnc = await _fetchText(result.servers, { method: 'POST', headers: postHeaders, timeoutMs: 6000 });
+    var serversEnc = await _fetchText(result.servers, { method: 'POST', headers: postHeaders, timeoutMs: 5000 });
     var servers = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidup', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: serversEnc }), timeoutMs: 6000
+      body: JSON.stringify({ text: serversEnc }), timeoutMs: 5000
     })).result || [];
 
     var serverResults = await Promise.all(servers.map(async function (srv) {
       if (!srv.data) return [];
       try {
         var streamEnc = await _fetchText(result.stream + '/' + srv.data,
-          { method: 'POST', headers: postHeaders, timeoutMs: 6000 });
+          { method: 'POST', headers: postHeaders, timeoutMs: 5000 });
         var stream = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-vidup', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: streamEnc }), timeoutMs: 6000
+          body: JSON.stringify({ text: streamEnc }), timeoutMs: 5000
         })).result;
         if (!stream || !stream.url) return [];
         (stream.tracks || []).forEach(function (t) {
@@ -1130,20 +1177,20 @@ async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 9. Fshare (movies only) ────────────────────────────────────────────
+// Fshare
 async function _invokeFshare(title, imdbId) {
   if (!title) return [];
   var slug = (title + ' episode 1 ' + (imdbId || ''))
     .toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-');
   var url = API.fshare + '/w/' + slug;
   try {
-    var html = await _getText(url, {}, 6000);
+    var html = await _getText(url, {}, 5000);
     var tokMatch = html.match(/Movie\.setSource\('([^']+)'/);
     if (!tokMatch) return [];
     var trailer = (html.match(/id=["']trailer["'][^>]+value=["']([^"']+)["']/i) || [])[1] || '';
     var res = JSON.parse(await _getText(
       API.fshare + '/api/file/' + tokMatch[1] + '/source?trailer=' +
-      encodeURIComponent(trailer) + '&type=watch', {}, 6000));
+      encodeURIComponent(trailer) + '&type=watch', {}, 5000));
     var file = res && res.data && res.data.file;
     if (!file) return [];
     var sources = (file.sources || []).concat(
@@ -1163,7 +1210,7 @@ async function _invokeFshare(title, imdbId) {
   } catch (e) { return []; }
 }
 
-// ── 10. Videasy (parallel servers) ─────────────────────────────────────
+// Videasy
 async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subtitleCb) {
   if (!title || !tmdbId) return [];
   var servers = ['myflixerzupcloud','downloader2','m4uhd','hdmovie','cdn',
@@ -1172,7 +1219,7 @@ async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subt
   var headers = { Accept: '*/*', Referer: 'https://player.videasy.to/', Origin: 'https://player.videasy.to' };
   var seed;
   try {
-    seed = (await _getJson(API.videasy + '/seed?mediaId=' + tmdbId, headers, 6000)).seed;
+    seed = (await _getJson(API.videasy + '/seed?mediaId=' + tmdbId, headers, 5000)).seed;
   } catch (e) { return []; }
   if (!seed) return [];
 
@@ -1186,10 +1233,10 @@ async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subt
           '&mediaType=tv&year=' + (year || '') + '&tmdbId=' + tmdbId +
           '&episodeId=' + episode + '&seasonId=' + season +
           '&imdbId=' + (imdbId || '') + '&enc=2&seed=' + encodeURIComponent(seed);
-      var encText = await _getText(url, headers, 6000);
+      var encText = await _getText(url, headers, 5000);
       var result = (await _fetch(MULTI_DECRYPT_API + '/dec-videasy', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: encText, id: tmdbId, seed: seed }), timeoutMs: 6000
+        body: JSON.stringify({ text: encText, id: tmdbId, seed: seed }), timeoutMs: 5000
       })).result;
       if (!result) return [];
       var out = [];
@@ -1213,14 +1260,14 @@ async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subt
   return out;
 }
 
-// ── 11. Cinejoy (parallel servers) ─────────────────────────────────────
+// Cinejoy — fixed double-fetch bug
 async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subtitleCb) {
   if (!title) return [];
   var isSeries = season != null && episode != null;
   var type = isSeries ? 'series' : 'movie';
   var headers = { Accept: '*/*', Origin: API.cinejoyBase, Referer: API.cinejoyBase + '/', 'User-Agent': PLAYER_UA };
   try {
-    var servers = ((JSON.parse(await _getText(API.cinejoy + '/servers', headers, 6000)).servers) || [])
+    var servers = ((JSON.parse(await _getText(API.cinejoy + '/servers', headers, 5000)).servers) || [])
       .map(function (s) { return s && s.name; }).filter(Boolean);
     var encodedTitle = encodeURIComponent(title);
 
@@ -1230,24 +1277,27 @@ async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subt
           '&year=' + (year || '') + '&imdb=' + (imdbId || '') + '&tmdb=' + (tmdbId || '') +
           '&server=' + server + (isSeries ? '&season=' + season + '&episode=' + episode : '');
         var encRes = JSON.parse(await _getText(
-          MULTI_DECRYPT_API + '/enc-cinejoy?url=' + encodeURIComponent(targetUrl), {}, 6000));
+          MULTI_DECRYPT_API + '/enc-cinejoy?url=' + encodeURIComponent(targetUrl), {}, 5000));
         if (!encRes || encRes.status !== 200 || !encRes.result || !encRes.result.data) return [];
         var decoded = _b64urlToBytes(encRes.result.data);
         if (!decoded) return [];
         var resp = await fetch(API.cinejoy + '/g', {
-          method: 'POST', headers: headers, body: decoded, timeoutMs: 6000
+          method: 'POST', headers: headers, body: decoded, timeoutMs: 5000
         });
         var buf = await Promise.resolve(resp && resp.arrayBuffer ? resp.arrayBuffer() : null);
         if (!buf) return [];
         var b64 = _bytesToB64url(new Uint8Array(buf));
-        var data = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-cinejoy', {
+
+        // FIXED: single fetch, not double
+        var decText = await _fetchText(MULTI_DECRYPT_API + '/dec-cinejoy', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: b64, state: encRes.result.state }), timeoutMs: 6000
-        })).result && JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-cinejoy', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: b64, state: encRes.result.state }), timeoutMs: 6000
-        })).result.data;
+          body: JSON.stringify({ text: b64, state: encRes.result.state }), timeoutMs: 5000
+        });
+        var decResult = JSON.parse(decText).result;
+        if (!decResult) return [];
+        var data = decResult.data;
         if (!data || data.error) return [];
+
         var out = [];
         (data.stream || []).forEach(function (st) {
           if (st.type === 'hls' && st.playlist) {
@@ -1282,36 +1332,140 @@ async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subt
   } catch (e) { return []; }
 }
 
+// Showbox — RESTORED, tight timeouts, no retry
+async function _invokeShowbox(imdbId, season, episode) {
+  var token = _readSetting('showboxToken');
+  if (!imdbId || !token) return [];
+  var HDR = {
+    Accept: 'application/json, text/html, */*',
+    'Accept-Language': 'en',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/139.0.0.0'
+  };
+  var STEP_TIMEOUT = 800;
+  try {
+    // 1. Search — single attempt (no retry loop)
+    var searchHtml = await _getText(API.showbox + '/search?keyword=' + imdbId, HDR, STEP_TIMEOUT);
+    var hrefMatch = searchHtml.match(
+      /class="film-name[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"/) ||
+      searchHtml.match(/<a[^>]+href="([^"]+)"[^>]*class="[^"]*film-name[^"]*"/);
+    if (!hrefMatch) return [];
+
+    // 2. Detail → mediaId
+    var detailHtml = await _getText(API.showbox + hrefMatch[1], HDR, STEP_TIMEOUT);
+    var idMatch = detailHtml.match(/class="heading-name[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"/);
+    if (!idMatch) return [];
+    var parts = idMatch[1].split('/');
+    var mediaId = parseInt(parts[parts.length - 1], 10);
+    if (!mediaId) return [];
+
+    // 3. Share key
+    var type = season != null ? 2 : 1;
+    var shareJson = await _getJson(
+      API.showbox + '/index/share_link?id=' + mediaId + '&type=' + type, HDR, STEP_TIMEOUT);
+    var shareLink = shareJson && shareJson.data && shareJson.data.link;
+    if (!shareLink) return [];
+    var shareKey = shareLink.split('/').pop();
+
+    // 4. Root file list
+    var listJson = await _getJson(
+      API.febbox + '/file/file_share_list?share_key=' + shareKey, HDR, STEP_TIMEOUT);
+    var fileData = listJson && listJson.data;
+    if (!fileData || !fileData.file_list) return [];
+
+    // 5. Find video file
+    var videoFile;
+    if (season != null && episode != null) {
+      var folder = fileData.file_list.find(function (f) {
+        return f.is_dir && (
+          (f.file_name || '').toLowerCase().indexOf('season ' + season) >= 0 ||
+          (f.file_name || '').toLowerCase().indexOf('s' + String(season).padStart(2, '0')) >= 0
+        );
+      }) || fileData.file_list.find(function (f) { return f.is_dir; });
+      if (!folder) return [];
+      var epJson = await _getJson(
+        API.febbox + '/file/file_share_list?share_key=' + shareKey + '&parent_id=' + folder.fid,
+        HDR, STEP_TIMEOUT);
+      var epList = (epJson && epJson.data && epJson.data.file_list) || [];
+      var pad = String(episode).padStart(2, '0');
+      videoFile = epList.find(function (f) {
+        if (f.is_dir) return false;
+        var name = (f.file_name || '').toLowerCase();
+        return name.indexOf('e' + pad) >= 0 || name.indexOf('ep' + pad) >= 0 ||
+               name.indexOf('episode ' + episode) >= 0;
+      });
+    } else {
+      videoFile = fileData.file_list.find(function (f) { return !f.is_dir; });
+    }
+    if (!videoFile) return [];
+
+    // 6. Quality list
+    var cookieToken = token.startsWith('ui=') ? token : 'ui=' + token;
+    var qualJson = await _getJson(
+      API.febbox + '/console/video_quality_list?fid=' + videoFile.fid + '&share_key=' + shareKey,
+      Object.assign({}, HDR, { Cookie: cookieToken }), STEP_TIMEOUT);
+    var qualHtml = qualJson && qualJson.html;
+    if (!qualHtml) return [];
+
+    var VIDEO_HEADERS = {
+      Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.8',
+      Connection: 'keep-alive', Range: 'bytes=0-',
+      Referer: API.febbox + '/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/139.0.0.0'
+    };
+    var out = [];
+    var re = /<div[^>]*class="[^"]*file_quality[^"]*"[^>]*>/g;
+    var mm;
+    while ((mm = re.exec(qualHtml)) !== null) {
+      var tag = mm[0];
+      var u = (tag.match(/data-url="([^"]+)"/) || [])[1];
+      var q = (tag.match(/data-quality="([^"]+)"/) || [])[1];
+      if (!u || !q) continue;
+      var isOrg = q === 'ORG';
+      out.push({
+        url: u.replace(/\\\//g, '/'),
+        quality: isOrg ? '2160p' : (q.match(/\d{3,4}/) || ['Auto'])[0] + 'p',
+        label: '[ShowBox' + (isOrg ? ' ORG' : '') + ']',
+        container: /\.m3u8/.test(u) ? 'hls' : 'unknown',
+        headers: VIDEO_HEADERS, kind: 'raw'
+      });
+    }
+    return out;
+  } catch (e) { console.warn('Showbox fail', String(e)); return []; }
+}
+
 // =============================================================================
-//  REGISTRY — FASTEST FIRST
+//  REGISTRY
 // =============================================================================
+// needsMeta: provider requires ctx.title and/or ctx.tmdbId to be resolved first
 var PROVIDER_REGISTRY = [
-  { key: 'p_vaplayer',   name: 'VaPlayer',   timeoutMs: 1500, needsTitle: false,
+  { key: 'p_vaplayer',   name: 'VaPlayer',   needsMeta: false, timeoutMs: 1000,
     run: function (c) { return _invokeVaPlayer(c.imdbId, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_vidlink',    name: 'Vidlink',    timeoutMs: 1500, needsTitle: false,
+  { key: 'p_showbox',    name: 'Showbox',    needsMeta: false, timeoutMs: 2200,
+    run: function (c) { return _invokeShowbox(c.imdbId, c.season, c.episode); } },
+  { key: 'p_vidlink',    name: 'Vidlink',    needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVidlink(c.tmdbId, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_vidrock',    name: 'Vidrock',    timeoutMs: 1500, needsTitle: false,
+  { key: 'p_vidrock',    name: 'Vidrock',    needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVidrock(c.tmdbId, c.season, c.episode); } },
-  { key: 'p_peachify',   name: 'Peachify',   timeoutMs: 1500, needsTitle: false,
+  { key: 'p_peachify',   name: 'Peachify',   needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokePeachify(c.tmdbId, c.season, c.episode); } },
-  { key: 'p_meowtv',     name: 'Meowtv',     timeoutMs: 1500, needsTitle: false,
+  { key: 'p_meowtv',     name: 'Meowtv',     needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeMeowtv(c.tmdbId, c.season, c.episode); } },
-  { key: 'p_vidfastpro', name: 'VidFastPro', timeoutMs: 1500, needsTitle: false,
+  { key: 'p_vidfastpro', name: 'VidFastPro', needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVidFastPro(c.tmdbId, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_vidcore',    name: 'Vidcore',    timeoutMs: 1500, needsTitle: false,
+  { key: 'p_vidcore',    name: 'Vidcore',    needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVidcore(c.tmdbId, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_vidup',      name: 'Vidup',      timeoutMs: 1500, needsTitle: false,
+  { key: 'p_vidup',      name: 'Vidup',      needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVidup(c.tmdbId, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_fshare',     name: 'Fshare',     timeoutMs: 1500, needsTitle: true,
+  { key: 'p_fshare',     name: 'Fshare',     needsMeta: true, timeoutMs: 1000,
     run: function (c) { return c.season == null ? _invokeFshare(c.title, c.imdbId) : Promise.resolve([]); } },
-  { key: 'p_videasy',    name: 'Videasy',    timeoutMs: 1500, needsTitle: true,
+  { key: 'p_videasy',    name: 'Videasy',    needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeVideasy(c.title, c.tmdbId, c.imdbId, c.year, c.season, c.episode, c.subtitleCb); } },
-  { key: 'p_cinejoy',    name: 'Cinejoy',    timeoutMs: 1500, needsTitle: true,
+  { key: 'p_cinejoy',    name: 'Cinejoy',    needsMeta: true, timeoutMs: 1000,
     run: function (c) { return _invokeCinejoy(c.title, c.imdbId, c.tmdbId, c.year, c.season, c.episode, c.subtitleCb); } }
 ];
 
 // =============================================================================
-//  ORCHESTRATION — the 3-second engine
+//  ORCHESTRATION
 // =============================================================================
 async function getVideoSources(episodeUrl, opts) {
   opts = opts || {};
@@ -1325,7 +1479,7 @@ async function getVideoSources(episodeUrl, opts) {
   var subs = [];
   var subtitleCb = function (s) { if (s && s.url) subs.push(s); };
 
-  // Extract imdbId/tmdbId from the episode JSON (no network needed)
+  // Extract imdbId/tmdbId from the episode JSON
   var parsedObj = null;
   if (typeof episodeUrl === 'string' && episodeUrl.charAt(0) === '{') {
     try { parsedObj = JSON.parse(episodeUrl); } catch (e) {}
@@ -1341,44 +1495,42 @@ async function getVideoSources(episodeUrl, opts) {
     }
   }
 
-  // Start Cinemeta in background — only providers that need title wait for it
-  var metaPromise = imdbId
-    ? withTimeout(
-        _cinemetaMeta(parsed.type === 'series' ? 'series' : 'movie', imdbId),
-        CINEMETA_TIMEOUT,
-        null
-      )
-    : Promise.resolve(null);
+  // Shared meta resolution — Cinemeta + TMDB find + TMDB detail fallback
+  var metaPromise = withTimeout(
+    _resolveMeta(imdbId, tmdbId, parsed.type === 'series' ? 'tv' : 'movie'),
+    META_TIMEOUT,
+    { title: null, year: null, tmdbId: tmdbId || null }
+  ).catch(function (e) {
+    console.warn('meta resolve failed', String(e));
+    return { title: null, year: null, tmdbId: tmdbId || null };
+  });
 
   var ctx = {
     imdbId: imdbId, tmdbId: tmdbId,
     title: null, year: null,
     season: parsed.season, episode: parsed.episode,
-    subtitleCb: subtitleCb,
-    _metaLoaded: false,
-    async ensureMeta() {
-      if (this._metaLoaded) return this.title;
-      this._metaLoaded = true;
-      var m = await metaPromise;
-      if (m) {
-        this.title = m.name || (m.aliases && m.aliases[0]) || null;
-        this.year = _year(m);
-        if (!this.tmdbId) this.tmdbId = m.moviedb_id || null;
-      }
-      return this.title;
-    }
+    subtitleCb: subtitleCb
   };
 
-  // Launch every provider in parallel, wrapped in withTimeout
+  // Fire every provider in parallel
   var jobPromises = [];
   for (var p = 0; p < PROVIDER_REGISTRY.length; p++) {
     (function (provider) {
-      var task = Promise.resolve().then(async function () {
-        if (provider.needsTitle) await ctx.ensureMeta();
-        return await provider.run(ctx);
-      });
+      var task;
+      if (provider.needsMeta) {
+        task = metaPromise.then(function (meta) {
+          if (meta) {
+            if (meta.title) ctx.title = meta.title;
+            if (meta.year) ctx.year = meta.year;
+            if (!ctx.tmdbId && meta.tmdbId) ctx.tmdbId = meta.tmdbId;
+          }
+          return provider.run(ctx);
+        });
+      } else {
+        task = Promise.resolve(provider.run(ctx));
+      }
       jobPromises.push(
-        withTimeout(task, provider.timeoutMs || PROVIDER_TIMEOUT).catch(function (e) {
+        withTimeout(task, provider.timeoutMs || PROVIDER_TIMEOUT, []).catch(function (e) {
           console.warn('provider fail', provider.key, String(e));
           return [];
         })
@@ -1386,22 +1538,20 @@ async function getVideoSources(episodeUrl, opts) {
     })(PROVIDER_REGISTRY[p]);
   }
 
-  // Add-ons — also parallel with their own timeout
+  // Add-ons
   cfg.addons.forEach(function (base) {
     jobPromises.push(
       withTimeout(_queryAddon(base, parsed, subtitleCb), ADDON_TIMEOUT).catch(function () { return []; })
     );
   });
 
-  // Wyzie — fire and forget (subtitle callback only)
+  // Wyzie
   if (cfg.wyzieKey && imdbId) {
     _invokeWyzieSubs(imdbId, parsed.season, parsed.episode, subtitleCb);
   }
 
-  // Wait for all — but hard-stop at GLOBAL_TIMEOUT
   var lists = await withTimeout(Promise.all(jobPromises), GLOBAL_TIMEOUT, []);
 
-  // Dedupe in registry order
   var seen = new Set();
   var out = [];
   for (var l = 0; l < lists.length; l++) {
@@ -1415,7 +1565,6 @@ async function getVideoSources(episodeUrl, opts) {
     }
   }
 
-  // Flush subtitles
   var cb = opts.onSubtitle || opts.subtitleCallback;
   if (typeof cb === 'function') {
     var subSeen = new Set();
@@ -1424,8 +1573,8 @@ async function getVideoSources(episodeUrl, opts) {
     });
   }
 
-  console.log('CineStream2: ' + out.length + ' streams in <' + GLOBAL_TIMEOUT + 'ms for ' +
-              (ctx.title || imdbId || tmdbId || '?'));
+  console.log('CineStream2: ' + out.length + ' streams | title=' + (ctx.title || '?') +
+              ' | tmdbId=' + (ctx.tmdbId || '?') + ' | imdbId=' + (ctx.imdbId || '?'));
   return out;
 }
 
@@ -1437,7 +1586,7 @@ function getLinks(id, opts)   { return getVideoSources(id, opts); }
 // =============================================================================
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    version: '1.0.2',
+    version: '1.0.3',
     getInfo: getInfo,
     getSettings: getSettings,
     getHome: getHome,
@@ -1450,6 +1599,8 @@ if (typeof module !== 'undefined' && module.exports) {
     getLinks: getLinks,
     // Test hooks
     withTimeout: withTimeout,
+    _resolveMeta: _resolveMeta,
+    _tmdbFind: _tmdbFind,
     _itemFromCinemeta: _itemFromCinemeta,
     _itemFromTmdb: _itemFromTmdb,
     _parseAddonUrls: _parseAddonUrls,
@@ -1460,6 +1611,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _combinedSettings: _combinedSettings,
     _toZangetsuStream: _toZangetsuStream,
     _invokeVaPlayer: _invokeVaPlayer,
+    _invokeShowbox: _invokeShowbox,
     _invokeVidlink: _invokeVidlink,
     _invokeVidrock: _invokeVidrock,
     _invokePeachify: _invokePeachify,
