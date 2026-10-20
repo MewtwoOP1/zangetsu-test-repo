@@ -1,20 +1,23 @@
 // =============================================================================
-//  cinestream2.js — CineStream2 provider for Zangetsu (QuickJS-NG runtime)
+//  cinestream2.js — CineStream2 provider for Zangetsu (QuickJS-NG)
 //
-//  Catalog : Cinemeta (primary) · TMDB enrichment · Kitsu (anime)
-//  Sources : Stremio add-ons (HTTPS/TORRENT/DEBRID/SUBTITLE) + direct extractors
-//  Runtime : QuickJS-NG — needs crypto.subtle, TextEncoder/TextDecoder,
-//            bytesToBase64/bytesFromBase64, fetch, URL, URLSearchParams.
+//  v1.0.1 — Fixes:
+//    • URLs now use tmdb:// scheme (matches working reference provider)
+//    • Episodes carry both id and videoId
+//    • _parseStreamId honours moviedb_id
+//    • TMDB path uses trailing-dot host when custom key is set
+//    • getDetail falls back gracefully when Cinemeta is slow/down
 //
-//  No video is hosted by this file. Streams come from user-configured add-ons.
-//  Ported from megix's Cloudstream CineStream plugin.
+//  Catalog : Cinemeta · TMDB · Kitsu
+//  Sources : Stremio add-ons + 15 direct extractors
+//  Runtime : QuickJS-NG (crypto.subtle, TextEncoder, bytesToBase64, fetch, URL)
 // =============================================================================
 
 var SOURCE_ID = (typeof __SOURCE_ID !== 'undefined' && __SOURCE_ID)
   ? String(__SOURCE_ID)
   : 'cinestream2';
 
-// ── Static endpoints ─────────────────────────────────────────────────────
+// ── Endpoints ───────────────────────────────────────────────────────────
 var CINEMETA            = 'https://v3-cinemeta.strem.io';
 var KITSU               = 'https://anime-kitsu.strem.fun';
 var HAGLUND             = 'https://arm.haglund.dev/api/v2';
@@ -27,7 +30,6 @@ var MULTI_DECRYPT_API   = 'https://enc-dec.app/api';
 var WYZIE_SUBS_API      = 'https://sub.wyzie.io';
 var PLAYER_UA           = 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36';
 
-// ── External service endpoints used by providers ─────────────────────────
 var API = {
   torrentio:      'https://torrentio.strem.fun/limit=4',
   vidlink:        'https://vidlink.pro',
@@ -35,7 +37,6 @@ var API = {
   vidcore:        'https://vidcore.io',
   vidup:          'https://vidup.to',
   vidrock:        'https://vidrock.ru',
-  vidzee:         'https://player.vidzee.wtf',
   videasy:        'https://api.speedracelight.com',
   vaplayer:       'https://streamdata.vaplayer.ru',
   fshare:         'https://fsharetv.cc',
@@ -59,80 +60,50 @@ function getInfo() {
   return {
     name: 'CineStream2',
     lang: 'en',
-    baseUrl: 'https://cinemeta-catalogs.strem.io',
+    baseUrl: 'https://www.themoviedb.org',
     logo: 'https://www.google.com/s2/favicons?sz=256&domain=strem.io',
     type: 'movie',
-    version: '1.0.0'
+    version: '1.0.1'
   };
 }
 
 function getSettings() {
   return [
-    {
-      key: 'tmdbApiKey',
-      label: 'TMDB API Key (optional)',
+    { key: 'tmdbApiKey', label: 'TMDB API Key (optional)',
       description: 'Personal TMDB v3 key. Leave blank to use the app default.',
-      type: 'text',
-      default: ''
-    },
-    {
-      key: 'addonUrls',
-      label: 'Stremio Add-on URLs',
+      type: 'text', default: '' },
+    { key: 'addonUrls', label: 'Stremio Add-on URLs',
       description: 'Comma / newline separated manifest URLs. Streams come from these add-ons.',
-      type: 'text',
-      default: ''
-    },
-    {
-      key: 'wyzieSubsKey',
-      label: 'Wyzie Subs API Key',
+      type: 'text', default: '' },
+    { key: 'wyzieSubsKey', label: 'Wyzie Subs API Key',
       description: 'Optional. Enables the Wyzie subtitle provider.',
-      type: 'text',
-      default: ''
-    },
-    {
-      key: 'showboxToken',
-      label: 'Showbox (Febbox) UI Token',
+      type: 'text', default: '' },
+    { key: 'showboxToken', label: 'Showbox (Febbox) UI Token',
       description: 'Optional. Bearer token from febbox.com console. Enables Showbox.',
-      type: 'text',
-      default: ''
-    },
-    {
-      key: 'castleKey',
-      label: 'Castle APK Sign Key',
+      type: 'text', default: '' },
+    { key: 'castleKey', label: 'Castle APK Sign Key',
       description: 'Optional. Enables the Castle provider.',
-      type: 'text',
-      default: ''
-    },
-    {
-      key: 'allowDownloadLinks',
-      label: 'Show download-only links',
-      description: 'Include sources labelled "Download" and video-downloads.googleusercontent links.',
-      type: 'enum',
-      default: 'false',
+      type: 'text', default: '' },
+    { key: 'allowDownloadLinks', label: 'Show download-only links',
+      description: 'Include sources labelled "Download" and video.googleusercontent links.',
+      type: 'enum', default: 'false',
       options: [
         { value: 'false', label: 'Off (recommended)' },
         { value: 'true',  label: 'On' }
-      ]
-    },
-    {
-      key: 'maxStreamsPerAddon',
-      label: 'Max streams per add-on',
+      ] },
+    { key: 'maxStreamsPerAddon', label: 'Max streams per add-on',
       description: 'Cap the number of streams returned from each configured add-on.',
-      type: 'enum',
-      default: '25',
+      type: 'enum', default: '25',
       options: [
         { value: '10',  label: '10' },
         { value: '25',  label: '25' },
         { value: '50',  label: '50' },
         { value: '100', label: '100' }
-      ]
-    }
+      ] }
   ];
 }
 
-// =============================================================================
-//  SETTING ACCESSORS
-// =============================================================================
+// ── Setting accessors ──────────────────────────────────────────────────
 function _readSetting(key) {
   try {
     var s = typeof __settings !== 'undefined' && __settings ? __settings[SOURCE_ID] : null;
@@ -162,19 +133,16 @@ function _combinedSettings() {
 }
 
 // =============================================================================
-//  BYTE / BASE64 / HEX
+//  BYTE HELPERS
 // =============================================================================
 function _strToBytes(s) { return new TextEncoder().encode(String(s)); }
 function _bytesToStr(b) { return new TextDecoder().decode(b); }
 function _b64ToBytes(s) { return bytesFromBase64(String(s)); }
 function _bytesToB64(b) { return bytesToBase64(new Uint8Array(b)); }
-
 function _hexToBytes(hex) {
   hex = String(hex);
   var out = new Uint8Array(hex.length / 2);
-  for (var i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
+  for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
   return out;
 }
 function _bytesToHex(b) {
@@ -182,7 +150,6 @@ function _bytesToHex(b) {
     return x.toString(16).padStart(2, '0');
   }).join('');
 }
-
 function _b64urlToBytes(s) {
   var v = String(s).replace(/-/g, '+').replace(/_/g, '/');
   while (v.length % 4) v += '=';
@@ -193,37 +160,28 @@ function _bytesToB64url(b) {
 }
 
 // =============================================================================
-//  WEB CRYPTO (QuickJS-NG provides crypto.subtle)
+//  WEB CRYPTO
 // =============================================================================
 async function _importAesCbc(rawKey) {
-  return await crypto.subtle.importKey(
-    'raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt', 'encrypt']);
+  return await crypto.subtle.importKey('raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt', 'encrypt']);
 }
 async function _importAesGcm(rawKey) {
-  return await crypto.subtle.importKey(
-    'raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt', 'encrypt']);
+  return await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt', 'encrypt']);
 }
-async function _aesCbcDecrypt(rawKey, iv, ciphertext) {
-  var key = await _importAesCbc(rawKey);
-  return new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-CBC', iv: iv }, key, ciphertext));
+async function _aesCbcDecrypt(rawKey, iv, ct) {
+  var k = await _importAesCbc(rawKey);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: iv }, k, ct));
 }
-async function _aesGcmDecrypt(rawKey, nonce, ciphertextWithTag, tagBits) {
-  var key = await _importAesGcm(rawKey);
+async function _aesGcmDecrypt(rawKey, nonce, ct, tagBits) {
+  var k = await _importAesGcm(rawKey);
   return new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: nonce, tagLength: tagBits || 128 },
-    key, ciphertextWithTag));
+    { name: 'AES-GCM', iv: nonce, tagLength: tagBits || 128 }, k, ct));
 }
 async function _hmacSha256(rawKeyBytes, dataBytes) {
-  var key = await crypto.subtle.importKey(
-    'raw', rawKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  var key = await crypto.subtle.importKey('raw', rawKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, dataBytes));
 }
-async function _sha256Hex(dataBytes) {
-  return _bytesToHex(await crypto.subtle.digest('SHA-256', dataBytes));
-}
 
-// ── Pure-JS MD5 (SubtleCrypto does not provide MD5) ──────────────────────
 function _md5(str) {
   function F(x, y, z) { return (x & y) | (~x & z); }
   function G(x, y, z) { return (x & z) | (y & ~z); }
@@ -231,17 +189,16 @@ function _md5(str) {
   function I(x, y, z) { return y ^ (x | ~z); }
   function rotl(x, c) { return (x << c) | (x >>> (32 - c)); }
   function add(a, b) { return (a + b) >>> 0; }
-  var S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-           5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-           4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-           6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  var S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+           5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+           4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+           6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
   var K = [];
   for (var i = 0; i < 64; i++) K[i] = (Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
   var bytes = _strToBytes(str);
   var bitLen = bytes.length * 8;
   var padded = new Uint8Array(((bytes.length + 8) >>> 6) * 64 + 64);
-  padded.set(bytes);
-  padded[bytes.length] = 0x80;
+  padded.set(bytes); padded[bytes.length] = 0x80;
   var dv = new DataView(padded.buffer);
   dv.setUint32(padded.length - 8, bitLen >>> 0, true);
   dv.setUint32(padded.length - 4, Math.floor(bitLen / 0x100000000), true);
@@ -252,10 +209,10 @@ function _md5(str) {
     var A = a0, B = b0, C = c0, D = d0;
     for (var k = 0; k < 64; k++) {
       var Fn, g;
-      if (k < 16)      { Fn = F(B, C, D); g = k; }
+      if (k < 16) { Fn = F(B, C, D); g = k; }
       else if (k < 32) { Fn = G(B, C, D); g = (5 * k + 1) % 16; }
       else if (k < 48) { Fn = H(B, C, D); g = (3 * k + 5) % 16; }
-      else             { Fn = I(B, C, D); g = (7 * k) % 16; }
+      else { Fn = I(B, C, D); g = (7 * k) % 16; }
       var tmp = D; D = C; C = B;
       B = add(B, rotl(add(add(A, Fn), add(K[k], M[g])), S[k]));
       A = tmp;
@@ -263,30 +220,27 @@ function _md5(str) {
     a0 = add(a0, A); b0 = add(b0, B); c0 = add(c0, C); d0 = add(d0, D);
   }
   var out = new DataView(new ArrayBuffer(16));
-  out.setUint32(0, a0, true);
-  out.setUint32(4, b0, true);
-  out.setUint32(8, c0, true);
-  out.setUint32(12, d0, true);
+  out.setUint32(0, a0, true); out.setUint32(4, b0, true);
+  out.setUint32(8, c0, true); out.setUint32(12, d0, true);
   return _bytesToHex(out.buffer);
 }
 
 // =============================================================================
-//  NAMED DECRYPTS (ported from CineStreamUtils.kt)
+//  NAMED DECRYPTS
 // =============================================================================
 async function decryptVidzeeUrl(encryptedUrl, secret) {
   try {
     var decoded = _b64ToBytes(encryptedUrl);
     var colonAt = decoded.indexOf(58);
     if (colonAt < 0) return null;
-    var iv         = decoded.slice(0, colonAt);
-    var ciphertext = decoded.slice(colonAt + 1);
+    var iv = decoded.slice(0, colonAt);
+    var ct = decoded.slice(colonAt + 1);
     var rawKey = new Uint8Array(32);
     var secBytes = _strToBytes(secret);
     rawKey.set(secBytes.slice(0, 32));
-    return _bytesToStr(await _aesCbcDecrypt(rawKey, iv, ciphertext));
+    return _bytesToStr(await _aesCbcDecrypt(rawKey, iv, ct));
   } catch (e) { return null; }
 }
-
 async function peachifyDecrypt(encrypt) {
   try {
     var parts = String(encrypt).split('.');
@@ -300,17 +254,15 @@ async function peachifyDecrypt(encrypt) {
     return _bytesToStr(await _aesGcmDecrypt(_hexToBytes(keyHex), iv, ct, 128));
   } catch (e) { return null; }
 }
-
 async function decryptVidrockUrl(payload) {
   try {
     var keyHex = '7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f';
     var ct = _b64urlToBytes(payload);
     var nonce = ct.slice(0, 12);
-    var tag   = ct.slice(12);
+    var tag = ct.slice(12);
     return _bytesToStr(await _aesGcmDecrypt(_hexToBytes(keyHex), nonce, tag, 128));
   } catch (e) { return null; }
 }
-
 async function decryptCastle(cipherTextB64, securityKeyB64) {
   var pepper = _strToBytes('T!BgJB');
   var keyWords = _b64ToBytes(securityKeyB64);
@@ -320,7 +272,6 @@ async function decryptCastle(cipherTextB64, securityKeyB64) {
   var ct = _b64ToBytes(cipherTextB64);
   return _bytesToStr(await _aesCbcDecrypt(keyMaterial, keyMaterial, ct));
 }
-
 var _HIND_SECRET_B64 = 'NWU5NjA4NWM1NmUwZjU0ZWRhNjU3NzkwYWM1OGQxOWIyNzE0NzljNTA0MzY3ZmM5ZTZhNmMzM2YxZjgyNGU2Yg==';
 async function hindmoviezSignHShare(rawId, domain) {
   var secret = _bytesToStr(_b64ToBytes(_HIND_SECRET_B64));
@@ -330,19 +281,17 @@ async function hindmoviezSignHShare(rawId, domain) {
   var sig = _bytesToHex(macBytes).slice(0, 16);
   return domain + '/r.php?d=' + encodeURIComponent(encoded) + '&t=' + t + '&s=' + sig;
 }
-
 async function generateSignedUrl(url, secret) {
   try {
     var u = new URL(url);
     var timestamp = Math.floor(Date.now() / 1000).toString();
     var mac = await _hmacSha256(_strToBytes(secret), _strToBytes(u.pathname + timestamp));
-    var sig = encodeURIComponent(_bytesToB64(mac));
-    return url + '?verify=' + timestamp + '-' + sig;
+    return url + '?verify=' + timestamp + '-' + encodeURIComponent(_bytesToB64(mac));
   } catch (e) { return null; }
 }
 
 // =============================================================================
-//  NETWORK HELPERS
+//  NETWORK
 // =============================================================================
 function _fetch(url, opts) {
   opts = opts || {};
@@ -367,9 +316,7 @@ function _fetchText(url, opts) {
     headers: opts.headers || {},
     body: opts.body,
     timeoutMs: opts.timeoutMs || 15000
-  }).then(function (r) {
-    return r && r.body != null ? r.body : '';
-  });
+  }).then(function (r) { return r && r.body != null ? r.body : ''; });
 }
 function _getJson(url, headers, timeoutMs) {
   return _fetch(url, { headers: headers || { Accept: 'application/json' }, timeoutMs: timeoutMs || 15000 });
@@ -379,21 +326,23 @@ function _getText(url, headers, timeoutMs) {
 }
 
 // =============================================================================
-//  TMDB / CINEMETA / KITSU HELPERS
+//  TMDB / CINEMETA
 // =============================================================================
+
+// FIX #4 — use trailing-dot host when a custom key is set (bypasses interceptor)
 function _tmdbPath(path) {
   var cfg = _combinedSettings();
-  var url = TMDB_API + path;
-  if (cfg.tmdbKey) {
-    url += (path.indexOf('?') >= 0 ? '&' : '?') + 'api_key=' + encodeURIComponent(cfg.tmdbKey);
-  }
-  return url;
+  if (!cfg.tmdbKey) return TMDB_API + path;
+  var base = 'https://api.themoviedb.org./3';
+  return base + path + (path.indexOf('?') >= 0 ? '&' : '?') +
+         'api_key=' + encodeURIComponent(cfg.tmdbKey);
 }
 function _tmdbJson(path) {
-  return _fetch(_tmdbPath(path), { timeoutMs: 12000 }).catch(function (e) {
-    console.warn('TMDB fail', path, e);
-    return null;
-  });
+  var cfg = _combinedSettings();
+  var headers = { Accept: 'application/json' };
+  if (cfg.tmdbKey) headers.Host = 'api.themoviedb.org';
+  return _fetch(_tmdbPath(path), { headers: headers, timeoutMs: 12000 })
+    .catch(function (e) { console.warn('TMDB fail', path, e); return null; });
 }
 function _tmdbImage(path, size) {
   if (!path) return null;
@@ -433,13 +382,19 @@ function _year(rec) {
 }
 function _pad(n) { n = parseInt(n, 10) || 0; return n < 10 ? '0' + n : String(n); }
 
+// FIX #1 — tmdb:// URLs (matching the working reference)
+function _tmdbUrl(type, id) {
+  return 'tmdb://' + (type === 'tv' || type === 'series' ? 'tv' : 'movie') + '/' + String(id);
+}
+
 // =============================================================================
 //  CATALOG ITEMS
 // =============================================================================
 function _itemFromCinemeta(m) {
   if (!m || !m.id) return null;
   var isTv = m.type === 'series';
-  var url = 'cinestream://' + (isTv ? 'series' : 'movie') + '/' + encodeURIComponent(m.id);
+  // FIX #1 — tmdb:// scheme with IMDB ID encoded
+  var url = _tmdbUrl(isTv ? 'tv' : 'movie', m.id);
   var title = (m.aliases && m.aliases.length && m.aliases[0]) || m.name || '';
   if (!title) return null;
   var item = {
@@ -452,6 +407,7 @@ function _itemFromCinemeta(m) {
     imdbId: m.id,
     tmdbIsTv: isTv
   };
+  if (m.moviedb_id) item.tmdbId = m.moviedb_id;
   if (m.imdbRating != null && isFinite(Number(m.imdbRating))) {
     item.score = Math.round(Number(m.imdbRating) * 10);
   }
@@ -465,7 +421,7 @@ function _itemFromTmdb(rec, forcedType) {
   if (rec.media_type && rec.media_type !== 'movie' && rec.media_type !== 'tv') return null;
   var title = _trim(rec.title || rec.name || '');
   if (!title) return null;
-  var url = 'cinestream://tmdb/' + (isTv ? 'tv' : 'movie') + '/' + String(rec.id);
+  var url = _tmdbUrl(isTv ? 'tv' : 'movie', rec.id);
   return {
     id: url, url: url,
     title: _year(rec) ? title + ' (' + _year(rec) + ')' : title,
@@ -538,28 +494,55 @@ function search(query, page, opts) {
 // =============================================================================
 //  DETAIL / EPISODES
 // =============================================================================
+
+// FIX #1 — accept tmdb:// for both IMDB IDs (tt…) and numeric TMDB IDs
 function _parseDetailUrl(value) {
   var s = String(value || '');
-  var m = s.match(/^cinestream:\/\/(movie|series|kitsu)\/(.+)$/i);
+  if (!s) return null;
+
+  // tmdb://movie/tt1234567  →  Cinemeta lookup
+  // tmdb://tv/tt1234567     →  Cinemeta series lookup
+  // tmdb://movie/12345      →  TMDB lookup
+  var m = s.match(/^tmdb:\/\/(movie|tv|series)\/([^\/?#]+)/i);
+  if (m) {
+    var kind = m[1].toLowerCase() === 'movie' ? 'movie' : 'tv';
+    var id = decodeURIComponent(m[2]);
+    if (/^tt\d+$/.test(id)) {
+      return { kind: kind === 'movie' ? 'movie' : 'series', id: id, source: 'cinemeta' };
+    }
+    if (/^\d+$/.test(id)) {
+      return { kind: 'tmdb', type: kind, id: id };
+    }
+  }
+
+  // Legacy / fallback cinestream:// schemes
+  m = s.match(/^cinestream:\/\/(movie|series|kitsu)\/(.+)$/i);
   if (m) return { kind: m[1].toLowerCase(), id: decodeURIComponent(m[2]) };
   m = s.match(/^cinestream:\/\/tmdb\/(movie|tv)\/(\d+)/i);
   if (m) return { kind: 'tmdb', type: m[1].toLowerCase(), id: m[2] };
-  m = s.match(/^tmdb:\/\/(movie|tv)\/(\d+)/i);
-  if (m) return { kind: 'tmdb', type: m[1].toLowerCase(), id: m[2] };
-  m = s.match(/^tt\d+/);
-  if (m) return { kind: 'movie', id: s };
+
+  // Bare IMDB ID
+  m = s.match(/^(tt\d+)/);
+  if (m) return { kind: 'movie', id: m[1] };
+
   return null;
 }
 
+// FIX #2 — include videoId alongside id (matches reference)
 function _episodeUrl(type, imdbId, tmdbId, season, episode) {
-  return JSON.stringify({
+  var kind = type === 'tv' || type === 'series' ? 'series' : 'movie';
+  var numericId = tmdbId || '';
+  var payload = {
     id:     imdbId || (tmdbId ? 'tmdb:' + tmdbId : ''),
+    videoId: imdbId || (tmdbId ? 'tmdb:' + tmdbId : ''),
     imdbId: imdbId || undefined,
     tmdbId: tmdbId || undefined,
-    type:   type === 'tv' || type === 'series' ? 'series' : 'movie',
+    type:   kind,
     season: season || 0,
     episode: episode || 0
-  });
+  };
+  if (numericId) payload.tmdbIsTv = kind === 'series';
+  return JSON.stringify(payload);
 }
 
 function _statusFromCinemeta(s) {
@@ -574,178 +557,198 @@ function getDetail(url, opts) {
   var parsed = _parseDetailUrl(url);
   if (!parsed) return Promise.resolve(null);
 
+  // ── Cinemeta path (movies and series with IMDB IDs) ─────────────────
   if (parsed.kind === 'movie' || parsed.kind === 'series') {
-    var type = parsed.kind;
+    var cmType = parsed.kind === 'series' ? 'series' : 'movie';
     return Promise.all([
-      _cinemetaMeta(type, parsed.id),
-      _enrichFromAioMetadata(type, parsed.id)
+      _cinemetaMeta(cmType, parsed.id),
+      _enrichFromAioMetadata(cmType, parsed.id)
     ]).then(function (rs) {
-      var meta = rs[0];
-      var extras = rs[1];
+      var meta = rs[0], extras = rs[1];
       if (!meta) return null;
-      var isTv = type === 'series';
-      var title = (meta.aliases && meta.aliases[0]) || meta.name || 'Untitled';
-      var year = _year(meta);
-      var genres = meta.genre || meta.genres || [];
-      var episodes = [];
-      if (isTv) {
-        episodes = (meta.videos || [])
-          .filter(function (v) { return v.season !== 0; })
-          .sort(function (a, b) { return (a.season - b.season) || (a.episode - b.episode); })
-          .map(function (v) {
-            return {
-              id: String(v.season) + 'x' + String(v.episode),
-              title: 'S' + _pad(v.season) + ' E' + _pad(v.episode) + ' - ' + (v.name || v.title || ''),
-              number: v.episode,
-              season: v.season,
-              url: _episodeUrl('series', meta.imdb_id || parsed.id, meta.moviedb_id, v.season, v.episode),
-              date: v.firstAired || v.released || null,
-              thumbnail: v.thumbnail || null
-            };
-          });
-      } else {
-        episodes = [{
-          id: 'movie', title: title, number: 1,
-          url: _episodeUrl('movie', meta.imdb_id || parsed.id, meta.moviedb_id, 0, 0)
-        }];
-      }
-      var result = {
-        id: url, url: url,
-        title: title,
-        cover: meta.poster || null,
-        banner: meta.background || (extras && extras.background) || null,
-        description: (meta.awards ? '[' + meta.awards + '] ' : '') + (meta.description || ''),
-        status: _statusFromCinemeta(meta.status),
-        genres: genres,
-        studios: [],
-        type: 'movie',
-        sourceId: SOURCE_ID,
-        year: year,
-        imdbId: meta.imdb_id || parsed.id,
-        tmdbId: meta.moviedb_id || null,
-        tmdbIsTv: isTv,
-        logo: meta.logo || (extras && extras.logo) || null,
-        episodes: episodes,
-        subCount: episodes.length,
-        dubCount: 0
-      };
-      if (meta.imdbRating) result.score = Math.round(Number(meta.imdbRating) * 10);
-      if (extras && extras.app_extras && extras.app_extras.cast) {
-        result.actors = extras.app_extras.cast.map(function (c) {
-          return { name: c.name, role: c.character, image: c.photo ? IMG_PROXY + c.photo : null };
-        }).filter(function (a) { return a.name; });
-      }
-      return result;
+      return _buildFromCinemeta(meta, parsed, extras, url);
     });
   }
 
+  // ── TMDB path ───────────────────────────────────────────────────────
   if (parsed.kind === 'tmdb') {
-    var tmdbType = parsed.type;
-    return _tmdbJson('/' + tmdbType + '/' + parsed.id + '?append_to_response=external_ids,credits,videos')
+    return _tmdbJson('/' + parsed.type + '/' + parsed.id +
+                     '?append_to_response=external_ids,credits,videos,alternative_titles')
       .then(function (info) {
         if (!info || info.id == null) return null;
-        var isTv = tmdbType === 'tv';
-        var title = info.title || info.name || 'Untitled';
-        var imdbId = (info.external_ids && info.external_ids.imdb_id) || null;
-        var genres = (info.genres || []).map(function (g) { return g.name; });
-        var episodes = [];
-
-        if (isTv) {
-          var seasonJobs = [];
-          var maxSeasons = Math.min(info.number_of_seasons || 1, 40);
-          for (var s = 1; s <= maxSeasons; s++) {
-            (function (seasonNo) {
-              seasonJobs.push(_tmdbJson('/tv/' + parsed.id + '/season/' + seasonNo));
-            })(s);
-          }
-          return Promise.all(seasonJobs).then(function (seasonData) {
-            seasonData.sort(function (a, b) { return (a.season_number || 0) - (b.season_number || 0); });
-            seasonData.forEach(function (sd) {
-              if (!sd || !sd.episodes) return;
-              sd.episodes.forEach(function (ep) {
-                if (ep.episode_number == null) return;
-                episodes.push({
-                  id: String(sd.season_number) + 'x' + String(ep.episode_number),
-                  title: 'S' + _pad(sd.season_number) + ' E' + _pad(ep.episode_number) + ' - ' + (ep.name || ''),
-                  number: ep.episode_number,
-                  season: sd.season_number,
-                  url: _episodeUrl('series', imdbId, parsed.id, sd.season_number, ep.episode_number),
-                  date: ep.air_date || null,
-                  thumbnail: ep.still_path ? TMDB_IMG + '/w300' + ep.still_path : null
-                });
-              });
-            });
-            return finalize();
-          });
-        } else {
-          episodes = [{
-            id: 'movie', title: title, number: 1,
-            url: _episodeUrl('movie', imdbId, parsed.id, 0, 0)
-          }];
-          return finalize();
-        }
-
-        function finalize() {
-          var result = {
-            id: url, url: url,
-            title: title,
-            cover: info.poster_path ? TMDB_IMG + '/w500' + info.poster_path : null,
-            banner: info.backdrop_path ? TMDB_IMG + '/w780' + info.backdrop_path : null,
-            description: info.overview || '',
-            status: _statusFromCinemeta(info.status),
-            genres: genres,
-            studios: [],
-            type: 'movie',
-            sourceId: SOURCE_ID,
-            year: (info.release_date || info.first_air_date || '').slice(0, 4) || null,
-            imdbId: imdbId,
-            tmdbId: info.id,
-            tmdbIsTv: isTv,
-            episodes: episodes,
-            subCount: episodes.length,
-            dubCount: 0
-          };
-          if (info.vote_average) result.score = Math.round(Number(info.vote_average) * 10);
-          return result;
-        }
+        return _buildFromTmdb(info, parsed, url);
       });
   }
 
+  // ── Kitsu bridge ────────────────────────────────────────────────────
   if (parsed.kind === 'kitsu') {
     return _externalIds('kitsu', parsed.id).then(function (ids) {
       if (ids && ids.imdb) {
-        return getDetail('cinestream://series/' + ids.imdb, opts);
+        return getDetail(_tmdbUrl('tv', ids.imdb), opts);
       }
       return _kitsuMeta(parsed.id).then(function (meta) {
         if (!meta) return null;
-        var episodes = (meta.videos || []).map(function (v) {
-          return {
-            id: String(v.season) + 'x' + String(v.episode),
-            title: 'S' + _pad(v.season) + ' E' + _pad(v.episode) + ' - ' + (v.title || ''),
-            number: v.episode, season: v.season,
-            url: _episodeUrl('series', null, meta.moviedb_id, v.season, v.episode),
-            date: v.firstAired || null, thumbnail: v.thumbnail || null
-          };
-        });
-        return {
-          id: url, url: url,
-          title: (meta.aliases && meta.aliases[0]) || meta.name || 'Untitled',
-          cover: meta.poster || null,
-          banner: meta.background || null,
-          description: meta.description || '',
-          status: _statusFromCinemeta(meta.status),
-          genres: meta.genres || meta.genre || [],
-          studios: [], type: 'movie', sourceId: SOURCE_ID,
-          year: _year(meta),
-          imdbId: null, tmdbId: meta.moviedb_id || null, tmdbIsTv: true,
-          episodes: episodes,
-          subCount: episodes.length, dubCount: 0
-        };
+        return _buildFromKitsu(meta, parsed, url);
       });
     });
   }
 
   return Promise.resolve(null);
+}
+
+function _buildFromCinemeta(meta, parsed, extras, sourceUrl) {
+  var isTv = parsed.kind === 'series';
+  var title = (meta.aliases && meta.aliases[0]) || meta.name || 'Untitled';
+  var year = _year(meta);
+  var genres = meta.genre || meta.genres || [];
+  var imdbId = meta.imdb_id || parsed.id;
+  var tmdbId = meta.moviedb_id || null;
+  var episodes = [];
+
+  if (isTv) {
+    episodes = (meta.videos || [])
+      .filter(function (v) { return v.season !== 0; })
+      .sort(function (a, b) { return (a.season - b.season) || (a.episode - b.episode); })
+      .map(function (v) {
+        return {
+          id: String(v.season) + 'x' + String(v.episode),
+          title: 'S' + _pad(v.season) + ' E' + _pad(v.episode) + ' - ' + (v.name || v.title || ''),
+          number: v.episode,
+          season: v.season,
+          url: _episodeUrl('series', imdbId, tmdbId, v.season, v.episode),
+          date: v.firstAired || v.released || null,
+          thumbnail: v.thumbnail || null
+        };
+      });
+  } else {
+    episodes = [{
+      id: 'movie', title: title, number: 1,
+      url: _episodeUrl('movie', imdbId, tmdbId, 0, 0)
+    }];
+  }
+
+  var result = {
+    id: sourceUrl, url: sourceUrl,
+    title: title,
+    cover: meta.poster || null,
+    banner: meta.background || (extras && extras.background) || null,
+    description: (meta.awards ? '[' + meta.awards + '] ' : '') + (meta.description || ''),
+    status: _statusFromCinemeta(meta.status),
+    genres: genres,
+    studios: [],
+    type: 'movie',
+    sourceId: SOURCE_ID,
+    year: year,
+    imdbId: imdbId,
+    tmdbId: tmdbId,
+    tmdbIsTv: isTv,
+    logo: meta.logo || (extras && extras.logo) || null,
+    episodes: episodes,
+    subCount: episodes.length,
+    dubCount: 0
+  };
+  if (meta.imdbRating) result.score = Math.round(Number(meta.imdbRating) * 10);
+  if (extras && extras.app_extras && extras.app_extras.cast) {
+    result.actors = extras.app_extras.cast.map(function (c) {
+      return { name: c.name, role: c.character, image: c.photo ? IMG_PROXY + c.photo : null };
+    }).filter(function (a) { return a.name; });
+  }
+  return result;
+}
+
+function _buildFromTmdb(info, parsed, sourceUrl) {
+  var isTv = parsed.type === 'tv';
+  var title = info.title || info.name || 'Untitled';
+  var imdbId = (info.external_ids && info.external_ids.imdb_id) || null;
+  var genres = (info.genres || []).map(function (g) { return g.name; });
+  var episodes = [];
+
+  if (isTv) {
+    var seasonJobs = [];
+    var maxSeasons = Math.min(info.number_of_seasons || 1, 40);
+    for (var s = 1; s <= maxSeasons; s++) {
+      (function (seasonNo) {
+        seasonJobs.push(_tmdbJson('/tv/' + parsed.id + '/season/' + seasonNo));
+      })(s);
+    }
+    return Promise.all(seasonJobs).then(function (seasonData) {
+      seasonData.sort(function (a, b) {
+        return (a && a.season_number || 0) - (b && b.season_number || 0);
+      });
+      seasonData.forEach(function (sd) {
+        if (!sd || !sd.episodes) return;
+        sd.episodes.forEach(function (ep) {
+          if (ep.episode_number == null) return;
+          episodes.push({
+            id: String(sd.season_number) + 'x' + String(ep.episode_number),
+            title: 'S' + _pad(sd.season_number) + ' E' + _pad(ep.episode_number) + ' - ' + (ep.name || ''),
+            number: ep.episode_number,
+            season: sd.season_number,
+            url: _episodeUrl('series', imdbId, parsed.id, sd.season_number, ep.episode_number),
+            date: ep.air_date || null,
+            thumbnail: ep.still_path ? TMDB_IMG + '/w300' + ep.still_path : null
+          });
+        });
+      });
+      return finalize();
+    });
+  } else {
+    episodes = [{
+      id: 'movie', title: title, number: 1,
+      url: _episodeUrl('movie', imdbId, parsed.id, 0, 0)
+    }];
+    return Promise.resolve(finalize());
+  }
+
+  function finalize() {
+    var result = {
+      id: sourceUrl, url: sourceUrl,
+      title: title,
+      cover: info.poster_path ? TMDB_IMG + '/w500' + info.poster_path : null,
+      banner: info.backdrop_path ? TMDB_IMG + '/w780' + info.backdrop_path : null,
+      description: info.overview || '',
+      status: _statusFromCinemeta(info.status),
+      genres: genres,
+      studios: [],
+      type: 'movie',
+      sourceId: SOURCE_ID,
+      year: (info.release_date || info.first_air_date || '').slice(0, 4) || null,
+      imdbId: imdbId,
+      tmdbId: info.id,
+      tmdbIsTv: isTv,
+      episodes: episodes,
+      subCount: episodes.length,
+      dubCount: 0
+    };
+    if (info.vote_average) result.score = Math.round(Number(info.vote_average) * 10);
+    return result;
+  }
+}
+
+function _buildFromKitsu(meta, parsed, sourceUrl) {
+  var episodes = (meta.videos || []).map(function (v) {
+    return {
+      id: String(v.season) + 'x' + String(v.episode),
+      title: 'S' + _pad(v.season) + ' E' + _pad(v.episode) + ' - ' + (v.title || ''),
+      number: v.episode, season: v.season,
+      url: _episodeUrl('series', null, meta.moviedb_id, v.season, v.episode),
+      date: v.firstAired || null, thumbnail: v.thumbnail || null
+    };
+  });
+  return {
+    id: sourceUrl, url: sourceUrl,
+    title: (meta.aliases && meta.aliases[0]) || meta.name || 'Untitled',
+    cover: meta.poster || null,
+    banner: meta.background || null,
+    description: meta.description || '',
+    status: _statusFromCinemeta(meta.status),
+    genres: meta.genres || meta.genre || [],
+    studios: [], type: 'movie', sourceId: SOURCE_ID,
+    year: _year(meta),
+    imdbId: null, tmdbId: meta.moviedb_id || null, tmdbIsTv: true,
+    episodes: episodes,
+    subCount: episodes.length, dubCount: 0
+  };
 }
 
 function getEpisodes(url, opts) {
@@ -755,7 +758,7 @@ function getEpisodes(url, opts) {
 }
 
 // =============================================================================
-//  STREMIO ADD-ON STACK
+//  STREMIO ADD-ONS
 // =============================================================================
 function _parseAddonUrls(raw) {
   var src = String(raw || '');
@@ -769,8 +772,8 @@ function _parseAddonUrls(raw) {
     var q = '', qi = v.indexOf('?');
     if (qi >= 0) { q = v.substring(qi + 1); v = v.substring(0, qi); }
     v = v.replace(/\/manifest\.json$/i, '').replace(/\/$/, '');
-    var normalized = v + (q ? '::q::' + q : '');
-    if (!seen[normalized]) { seen[normalized] = true; out.push(normalized); }
+    var n = v + (q ? '::q::' + q : '');
+    if (!seen[n]) { seen[n] = true; out.push(n); }
   }
   return out;
 }
@@ -786,15 +789,16 @@ function _manifestUrl(base) {
 }
 function _streamEndpoint(base, type, id) {
   var p = _addonParts(base);
-  return p.root + '/stream/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) + '.json' +
-    (p.query ? '?' + p.query : '');
+  return p.root + '/stream/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) +
+    '.json' + (p.query ? '?' + p.query : '');
 }
 function _subtitleEndpoint(base, type, id) {
   var p = _addonParts(base);
-  return p.root + '/subtitles/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) + '.json' +
-    (p.query ? '?' + p.query : '');
+  return p.root + '/subtitles/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) +
+    '.json' + (p.query ? '?' + p.query : '');
 }
 
+// FIX #3 — accept videoId + moviedb_id
 function _parseStreamId(raw) {
   var item = raw && typeof raw === 'object' ? raw : null;
   if (!item) {
@@ -802,13 +806,26 @@ function _parseStreamId(raw) {
     if (s.charAt(0) === '{') { try { item = JSON.parse(s); } catch (e) {} }
     if (!item) item = { id: s };
   }
-  var type = (item.type === 'tv' || item.type === 'series') ? 'series' : 'movie';
-  var season  = parseInt(item.season, 10)  || 0;
+  var rawId = String(item.videoId || item.id || '');
+  var kind = String(item.type || (item.season || item.episode ? 'series' : 'movie')).toLowerCase();
+  var type = kind === 'series' || kind === 'tv' ? 'series' : 'movie';
+  var season = parseInt(item.season, 10) || 0;
   var episode = parseInt(item.episode, 10) || 0;
-  var imdb  = String(item.imdbId || item.imdb_id || '');
-  var tmdb  = item.tmdbId || item.tmdb_id || null;
+  var imdb = String(item.imdbId || item.imdb_id || '');
+  var tmdb = item.tmdbId || item.tmdb_id || item.moviedb_id || null;
   var ids = [], seen = {};
-  function add(v) { v = String(v == null ? '' : v); if (v && !seen[v]) { seen[v] = true; ids.push(v); } }
+
+  function add(v) {
+    v = String(v == null ? '' : v);
+    if (v && !seen[v]) { seen[v] = true; ids.push(v); }
+  }
+
+  // Add rawId only if it looks like a real ID (not a URL)
+  if (rawId && !/^(?:tmdb|cinestream|imdb):\/\//i.test(rawId) && /^(?:tt\d+|\d+)$/.test(rawId)) {
+    if (!imdb && /^tt\d+$/.test(rawId)) imdb = rawId;
+    if (!tmdb && /^\d+$/.test(rawId)) tmdb = rawId;
+  }
+
   if (imdb) {
     if (type === 'series' && season > 0 && episode > 0) add(imdb + ':' + season + ':' + episode);
     add(imdb);
@@ -842,8 +859,8 @@ function _toZangetsuStream(raw, sourceName, allowDownload) {
   var headers = {};
   var hints = raw.behaviorHints || {};
   var proxyReq = (hints.proxyHeaders && hints.proxyHeaders.request) || {};
-  if (proxyReq.Referer)   headers.Referer = proxyReq.Referer;
-  if (proxyReq.Origin)    headers.Origin = proxyReq.Origin;
+  if (proxyReq.Referer) headers.Referer = proxyReq.Referer;
+  if (proxyReq.Origin) headers.Origin = proxyReq.Origin;
   if (proxyReq['User-Agent']) headers['User-Agent'] = proxyReq['User-Agent'];
   if (!headers['User-Agent'] && hints.headers) {
     ['User-Agent', 'Referer', 'Origin'].forEach(function (k) {
@@ -857,12 +874,9 @@ function _toZangetsuStream(raw, sourceName, allowDownload) {
   if (raw.description) labelParts.push(raw.description);
 
   return {
-    url: url,
-    quality: quality,
+    url: url, quality: quality,
     label: labelParts.join(' · ').slice(0, 300),
-    container: container,
-    headers: headers,
-    kind: 'raw'
+    container: container, headers: headers, kind: 'raw'
   };
 }
 
@@ -885,9 +899,7 @@ function _queryAddon(base, parsed, subtitleCb) {
     if (!manifest) return [];
     var resources = manifest.resources;
     var supportsStream = !Array.isArray(resources) ||
-                         resources.some(function (r) {
-                           return r === 'stream' || (r && r.name === 'stream');
-                         });
+      resources.some(function (r) { return r === 'stream' || (r && r.name === 'stream'); });
     var jobs = [];
     if (supportsStream) {
       parsed.ids.forEach(function (id) {
@@ -913,9 +925,7 @@ function _queryAddon(base, parsed, subtitleCb) {
     }
     if (subtitleCb && parsed.ids.length) {
       var supportsSubs = !Array.isArray(resources) ||
-                         resources.some(function (r) {
-                           return r === 'subtitles' || (r && r.name === 'subtitles');
-                         });
+        resources.some(function (r) { return r === 'subtitles' || (r && r.name === 'subtitles'); });
       if (supportsSubs) {
         jobs.push(_fetch(_subtitleEndpoint(base, parsed.type, parsed.ids[0])).then(function (data) {
           var subs = data && Array.isArray(data.subtitles) ? data.subtitles : [];
@@ -931,10 +941,7 @@ function _queryAddon(base, parsed, subtitleCb) {
       lists.forEach(function (l) { out = out.concat(l); });
       return out.slice(0, cfg.maxPerAddon);
     });
-  }).catch(function (e) {
-    console.warn('addon fail', base, String(e));
-    return [];
-  });
+  }).catch(function (e) { console.warn('addon fail', base, String(e)); return []; });
 }
 
 function _invokeWyzieSubs(imdbId, season, episode, subtitleCb) {
@@ -954,12 +961,10 @@ function _invokeWyzieSubs(imdbId, season, episode, subtitleCb) {
 // =============================================================================
 //  DIRECT EXTRACTORS
 // =============================================================================
-
-// ── 1. Videasy ─────────────────────────────────────────────────────────
 async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subtitleCb) {
   if (!title || !tmdbId) return [];
-  var servers = ['myflixerzupcloud', 'downloader2', 'm4uhd', 'hdmovie', 'cdn',
-                 'superflix', 'lamovie', 'jett', 'tejo', 'neon2', 'ym'];
+  var servers = ['myflixerzupcloud','downloader2','m4uhd','hdmovie','cdn',
+                 'superflix','lamovie','jett','tejo','neon2','ym'];
   var encTitle = encodeURIComponent(encodeURIComponent(title));
   var headers = { Accept: '*/*', Referer: 'https://player.videasy.to/', Origin: 'https://player.videasy.to' };
   var out = [];
@@ -989,12 +994,10 @@ async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subt
         (result.sources || []).forEach(function (s) {
           if (!s || !s.url) return;
           out.push({
-            url: s.url,
-            quality: s.quality || 'Auto',
+            url: s.url, quality: s.quality || 'Auto',
             label: '[Videasy ' + server + '] ' + (s.quality || ''),
             container: /\.m3u8/i.test(s.url) ? 'hls' : /\.(mp4|mkv)/i.test(s.url) ? 'mp4' : 'unknown',
-            headers: headers,
-            kind: 'raw'
+            headers: headers, kind: 'raw'
           });
         });
         if (subtitleCb) {
@@ -1008,7 +1011,6 @@ async function _invokeVideasy(title, tmdbId, imdbId, year, season, episode, subt
   } catch (e) { return []; }
 }
 
-// ── 2. Vidlink ─────────────────────────────────────────────────────────
 async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   try {
@@ -1020,8 +1022,7 @@ async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
     var epUrl = season == null
       ? API.vidlink + '/api/b/movie/' + payload
       : API.vidlink + '/api/b/tv/' + payload + '/' + season + '/' + episode;
-    var text = await _getText(epUrl, headers);
-    var data = JSON.parse(text);
+    var data = JSON.parse(await _getText(epUrl, headers));
     var stream = data && data.stream;
     if (!stream) return [];
     var out = [];
@@ -1034,8 +1035,7 @@ async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
         quality: k === '1080' ? '1080p' : k === '720' ? '720p' : k === '480' ? '480p' : k === '360' ? '360p' : 'Auto',
         label: '[VidLink] ' + k,
         container: q.type === 'm3u8' || /\.m3u8/i.test(q.url) ? 'hls' : 'unknown',
-        headers: q.headers || {},
-        kind: 'raw'
+        headers: q.headers || {}, kind: 'raw'
       });
     });
     if (subtitleCb) {
@@ -1047,7 +1047,6 @@ async function _invokeVidlink(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 3. VidFastPro ──────────────────────────────────────────────────────
 async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var base = API.vidfast;
@@ -1075,11 +1074,10 @@ async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
     var servers = (dec && dec.result) || [];
     var out = [];
     for (var i = 0; i < servers.length; i++) {
-      var srv = servers[i];
-      if (!srv || !srv.data) continue;
       try {
-        var finalUrl = result.stream + '/' + srv.data;
-        var streamEnc = await _fetchText(finalUrl, { method: 'POST', headers: postHeaders });
+        var srv = servers[i];
+        if (!srv || !srv.data) continue;
+        var streamEnc = await _fetchText(result.stream + '/' + srv.data, { method: 'POST', headers: postHeaders });
         var finalTxt = await _fetchText(MULTI_DECRYPT_API + '/dec-vidfast', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1095,12 +1093,10 @@ async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
         }
         var is4k = r.is4kAvailable || /4K/i.test(srv.description || '');
         out.push({
-          url: r.url,
-          quality: is4k ? '2160p' : '1080p',
+          url: r.url, quality: is4k ? '2160p' : '1080p',
           label: '[VidFastPro ' + (srv.name || '') + ']',
           container: /\.m3u8/i.test(r.url) ? 'hls' : 'unknown',
-          headers: postHeaders,
-          kind: 'raw'
+          headers: postHeaders, kind: 'raw'
         });
       } catch (e) {}
     }
@@ -1108,7 +1104,6 @@ async function _invokeVidFastPro(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 4. Cinejoy ─────────────────────────────────────────────────────────
 async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subtitleCb) {
   if (!title) return [];
   var isSeries = season != null && episode != null;
@@ -1121,8 +1116,8 @@ async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subt
     var encodedTitle = encodeURIComponent(title);
     var out = [];
     for (var i = 0; i < servers.length; i++) {
-      var server = servers[i];
       try {
+        var server = servers[i];
         var targetUrl = API.cinejoy + '/?title=' + encodedTitle + '&type=' + type +
           '&year=' + (year || '') + '&imdb=' + (imdbId || '') + '&tmdb=' + (tmdbId || '') +
           '&server=' + server + (isSeries ? '&season=' + season + '&episode=' + episode : '');
@@ -1134,13 +1129,9 @@ async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subt
         var decoded = _b64urlToBytes(dataB64);
         if (!decoded) continue;
         var resp = await fetch(API.cinejoy + '/g', {
-          method: 'POST',
-          headers: headers,
-          body: decoded,
-          timeoutMs: 15000
+          method: 'POST', headers: headers, body: decoded, timeoutMs: 15000
         });
-        var bytes = resp && resp.arrayBuffer ? resp.arrayBuffer() : null;
-        var buf = await Promise.resolve(bytes);
+        var buf = await Promise.resolve(resp && resp.arrayBuffer ? resp.arrayBuffer() : null);
         if (!buf) continue;
         var bytesArr = new Uint8Array(buf);
         var b64 = _bytesToB64url(bytesArr);
@@ -1184,7 +1175,6 @@ async function _invokeCinejoy(title, imdbId, tmdbId, year, season, episode, subt
   } catch (e) { return []; }
 }
 
-// ── 5. Meowtv ──────────────────────────────────────────────────────────
 async function _invokeMeowtv(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var servers = ['ipcloud', 'dcloud', 'tik', 'turkce', 'hindiv3'];
@@ -1197,14 +1187,12 @@ async function _invokeMeowtv(tmdbId, season, episode) {
       var url = API.meowtv + '/streams/' + type + '/' + tmdbId;
       if (season != null) url += '/' + season + '/' + episode;
       url += '?s=' + server;
-      var txt = await _getText(url, headers);
-      var json = JSON.parse(txt);
-      var decTxt = await _fetchText(MULTI_DECRYPT_API + '/dec-meowtv', {
+      var json = JSON.parse(await _getText(url, headers));
+      var dec = JSON.parse(await _fetchText(MULTI_DECRYPT_API + '/dec-meowtv', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: json })
-      });
-      var dec = JSON.parse(decTxt);
+      }));
       var r = dec && dec.result;
       if (!r || !r.url) continue;
       out.push({
@@ -1218,7 +1206,6 @@ async function _invokeMeowtv(tmdbId, season, episode) {
   return out;
 }
 
-// ── 6. VaPlayer ────────────────────────────────────────────────────────
 async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
   if (!imdbId) return [];
   var referer = 'https://nextgencloudfabric.com/';
@@ -1226,14 +1213,12 @@ async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
     ? API.vaplayer + '/api.php?imdb=' + imdbId + '&type=movie'
     : API.vaplayer + '/api.php?imdb=' + imdbId + '&type=tv&season=' + season + '&episode=' + episode;
   try {
-    var txt = await _getText(url, { Referer: referer });
-    var res = JSON.parse(txt);
+    var res = JSON.parse(await _getText(url, { Referer: referer }));
     var out = [];
     ((res && res.data && res.data.stream_urls) || []).forEach(function (u) {
       if (!u) return;
       out.push({
-        url: u, quality: 'Auto',
-        label: '[VaPlayer]',
+        url: u, quality: 'Auto', label: '[VaPlayer]',
         container: /\.m3u8/i.test(u) ? 'hls' : 'unknown',
         headers: { Referer: referer }, kind: 'raw'
       });
@@ -1247,7 +1232,6 @@ async function _invokeVaPlayer(imdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 7. Fshare ──────────────────────────────────────────────────────────
 async function _invokeFshare(title, imdbId) {
   if (!title) return [];
   var slug = (title + ' episode 1 ' + (imdbId || ''))
@@ -1260,9 +1244,8 @@ async function _invokeFshare(title, imdbId) {
     var token = tokMatch[1];
     var trailerMatch = html.match(/id=["']trailer["'][^>]+value=["']([^"']+)["']/i);
     var trailer = trailerMatch ? trailerMatch[1] : '';
-    var txt = await _getText(
-      API.fshare + '/api/file/' + token + '/source?trailer=' + encodeURIComponent(trailer) + '&type=watch');
-    var res = JSON.parse(txt);
+    var res = JSON.parse(await _getText(
+      API.fshare + '/api/file/' + token + '/source?trailer=' + encodeURIComponent(trailer) + '&type=watch'));
     var file = res && res.data && res.data.file;
     if (!file) return [];
     var sources = (file.sources || []).concat(
@@ -1282,7 +1265,6 @@ async function _invokeFshare(title, imdbId) {
   } catch (e) { return []; }
 }
 
-// ── 8. Moviebox ────────────────────────────────────────────────────────
 async function _invokeMoviebox(title, season, episode, subtitleCb) {
   if (!title) return [];
   var HOST = 'h5-api.aoneroom.com', BASE = 'https://' + HOST;
@@ -1298,21 +1280,21 @@ async function _invokeMoviebox(title, season, episode, subtitleCb) {
 
     var baseHeaders = {
       'X-Client-Info': '{"timezone":"Africa/Nairobi"}',
-      'Accept-Language': 'en-US,en;q=0.5',
-      Accept: 'application/json', Referer: BASE, Host: HOST,
-      Connection: 'keep-alive', Authorization: 'Bearer ' + token,
+      'Accept-Language': 'en-US,en;q=0.5', Accept: 'application/json',
+      Referer: BASE, Host: HOST, Connection: 'keep-alive',
+      Authorization: 'Bearer ' + token,
       'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/138.0.0.0'
     };
 
     var subjectType = season != null ? 2 : 1;
-    var searchResp = await _fetchText(BASE + '/wefeed-h5api-bff/subject/search', {
+    var searchData = JSON.parse(await _fetchText(BASE + '/wefeed-h5api-bff/subject/search', {
       method: 'POST',
       headers: Object.assign({}, baseHeaders, { 'Content-Type': 'application/json' }),
       body: JSON.stringify({ keyword: title, page: 1, perPage: 24, subjectType: subjectType })
-    });
-    var searchData = JSON.parse(searchResp).data;
+    })).data;
     if (searchData && searchData.data) searchData = searchData.data;
     var items = (searchData && searchData.items) || [];
+
     var SEASON_SUFFIX = /\sS\d+(?:-S?\d+)*$/i;
     var titleRe = new RegExp('^' + title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
                              '(?:\\s+\\[([^\\]]+)\\])?$', 'i');
@@ -1320,8 +1302,7 @@ async function _invokeMoviebox(title, season, episode, subtitleCb) {
     for (var i = 0; i < items.length; i++) {
       var item = items[i];
       if (!item.subjectId) continue;
-      var clean = (item.title || '').replace(SEASON_SUFFIX, '');
-      var m = clean.match(titleRe);
+      var m = (item.title || '').replace(SEASON_SUFFIX, '').match(titleRe);
       if (!m) continue;
       if (!unique.has(item.subjectId)) unique.set(item.subjectId, m[1] || 'Original');
     }
@@ -1332,9 +1313,8 @@ async function _invokeMoviebox(title, season, episode, subtitleCb) {
     for (var e = 0; e < entries.length; e++) {
       var subjectId = entries[e][0], language = entries[e][1];
       try {
-        var detailRaw = await _getText(
-          'https://h5.aoneroom.com/wefeed-h5-bff/web/post/list/subject?id=' + subjectId);
-        var detailObj = JSON.parse(detailRaw);
+        var detailObj = JSON.parse(await _getText(
+          'https://h5.aoneroom.com/wefeed-h5-bff/web/post/list/subject?id=' + subjectId));
         var inner = detailObj.data && detailObj.data.items && detailObj.data.items[0];
         var detailPath = inner && inner.subject && inner.subject.detailPath;
         if (!detailPath) continue;
@@ -1383,7 +1363,7 @@ async function _invokeMoviebox(title, season, episode, subtitleCb) {
           });
         });
         (downloadData && downloadData.captions || []).forEach(function (s) {
-          if (s.url) subtitleCb({ url: s.url, lang: s.lanName || s.lan || 'Unknown' });
+          if (s.url && subtitleCb) subtitleCb({ url: s.url, lang: s.lanName || s.lan || 'Unknown' });
         });
       } catch (e) {}
     }
@@ -1391,7 +1371,6 @@ async function _invokeMoviebox(title, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 9. Showbox (Febbox) ────────────────────────────────────────────────
 async function _invokeShowbox(imdbId, season, episode) {
   var token = _readSetting('showboxToken');
   if (!imdbId || !token) return [];
@@ -1409,8 +1388,7 @@ async function _invokeShowbox(imdbId, season, episode) {
           /class="film-name[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"/) ||
           searchHtml.match(/<a[^>]+href="([^"]+)"[^>]*class="[^"]*film-name[^"]*"/);
         if (!hrefMatch) continue;
-        var detailUrl = API.showbox + hrefMatch[1];
-        var detailHtml = await _getText(detailUrl, HDR);
+        var detailHtml = await _getText(API.showbox + hrefMatch[1], HDR);
         var idMatch = detailHtml.match(/class="heading-name[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"/);
         if (idMatch) {
           var parts = idMatch[1].split('/');
@@ -1490,14 +1468,11 @@ async function _invokeShowbox(imdbId, season, episode) {
   } catch (e) { return []; }
 }
 
-// ── 10. Castle (AES-CBC) ───────────────────────────────────────────────
 async function _invokeCastle(title, season, episode, subtitleCb) {
   if (!title) return [];
   var headers = {
-    'User-Agent': 'okhttp/4.9.3',
-    Accept: 'application/json',
-    'Accept-Language': 'en-US,en;q=0.9',
-    Connection: 'Keep-Alive',
+    'User-Agent': 'okhttp/4.9.3', Accept: 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9', Connection: 'Keep-Alive',
     Referer: API.castle + '/'
   };
   var pkg = 'com.external.castle', channel = 'IndiaA', clientType = '1', apiLang = 'en-US';
@@ -1515,17 +1490,14 @@ async function _invokeCastle(title, season, episode, subtitleCb) {
     var searchInner;
     try { searchInner = JSON.parse(searchEnc).data || searchEnc; }
     catch (e) { searchInner = searchEnc; }
-    var searchRaw = await decryptCastle(searchInner, securityKey);
-    var searchData = JSON.parse(searchRaw);
-    var rows = searchData.rows || [];
+    var rows = JSON.parse(await decryptCastle(searchInner, securityKey)).rows || [];
     if (!rows.length) return [];
 
     var movieId = '';
     for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      var t = r.title || r.name || '';
+      var t = rows[i].title || rows[i].name || '';
       if (t.indexOf(title) >= 0 || title.indexOf(t) >= 0) {
-        movieId = r.id || r.redirectId || r.redirectIdStr || '';
+        movieId = rows[i].id || rows[i].redirectId || rows[i].redirectIdStr || '';
         if (movieId) break;
       }
     }
@@ -1567,17 +1539,17 @@ async function _invokeCastle(title, season, episode, subtitleCb) {
     }
     if (!target || !target.id) return [];
 
-    var body = {
-      mode: '1', appMarket: 'GuanWang', clientType: clientType, woolUser: 'false',
-      apkSignKey: _readSetting('castleKey') || '',
-      androidVersion: '13', movieId: effectiveMovieId, episodeId: target.id,
-      isNewUser: 'true', resolution: '2', packageName: pkg
-    };
     var videoEnc = await _fetchText(
       API.castle + '/film-api/v2.0.1/movie/getVideo2?clientType=' + clientType +
       '&packageName=' + pkg + '&channel=' + channel + '&lang=' + apiLang,
-      { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body) });
+      { method: 'POST',
+        headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          mode: '1', appMarket: 'GuanWang', clientType: clientType, woolUser: 'false',
+          apkSignKey: _readSetting('castleKey') || '',
+          androidVersion: '13', movieId: effectiveMovieId, episodeId: target.id,
+          isNewUser: 'true', resolution: '2', packageName: pkg
+        }) });
     var videoInner;
     try { videoInner = JSON.parse(videoEnc).data || videoEnc; }
     catch (e) { videoInner = videoEnc; }
@@ -1591,13 +1563,14 @@ async function _invokeCastle(title, season, episode, subtitleCb) {
       });
     }
     (videoData.subtitles || []).forEach(function (sub) {
-      if (sub && sub.url) subtitleCb({ url: sub.url, lang: sub.abbreviate || sub.title || 'English' });
+      if (sub && sub.url && subtitleCb) {
+        subtitleCb({ url: sub.url, lang: sub.abbreviate || sub.title || 'English' });
+      }
     });
     return out;
   } catch (e) { return []; }
 }
 
-// ── 11. Peachify (AES-GCM) ─────────────────────────────────────────────
 async function _invokePeachify(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var headers = {
@@ -1611,8 +1584,7 @@ async function _invokePeachify(tmdbId, season, episode) {
       var url = season == null
         ? API.peachify + '/' + servers[i] + '/movie/' + tmdbId
         : API.peachify + '/' + servers[i] + '/tv/' + tmdbId + '/' + season + '/' + episode;
-      var text = await _getText(url, headers);
-      var encrypt = JSON.parse(text).data;
+      var encrypt = JSON.parse(await _getText(url, headers)).data;
       if (!encrypt) continue;
       var decrypted = await peachifyDecrypt(encrypt);
       if (!decrypted) continue;
@@ -1647,26 +1619,23 @@ async function _invokePeachify(tmdbId, season, episode) {
   return results;
 }
 
-// ── 12. Vidrock (AES-GCM) ──────────────────────────────────────────────
 async function _invokeVidrock(tmdbId, season, episode) {
   if (!tmdbId) return [];
   var type = season == null ? 'movie' : 'tv';
   var query = season == null ? String(tmdbId) : tmdbId + '_' + season + '_' + episode;
   var headers = { Origin: API.vidrock, Referer: API.vidrock + '/', 'User-Agent': PLAYER_UA };
   try {
-    var text = await _getText(API.vidrock + '/api/' + type + '/' + query + '/', headers);
-    var data = JSON.parse(text);
+    var data = JSON.parse(await _getText(API.vidrock + '/api/' + type + '/' + query + '/', headers));
     var out = [];
     var keys = Object.keys(data);
     for (var i = 0; i < keys.length; i++) {
-      var serverName = keys[i];
-      var encUrl = data[serverName] && data[serverName].url;
+      var encUrl = data[keys[i]] && data[keys[i]].url;
       if (!encUrl || encUrl === 'error' || encUrl === 'null') continue;
       var dec = await decryptVidrockUrl(encUrl);
       if (!dec) continue;
       out.push({
         url: dec, quality: 'Auto',
-        label: '[Vidrock ' + serverName + ']',
+        label: '[Vidrock ' + keys[i] + ']',
         container: /m3u8/i.test(dec) ? 'hls' : 'unknown',
         headers: headers, kind: 'raw'
       });
@@ -1675,7 +1644,6 @@ async function _invokeVidrock(tmdbId, season, episode) {
   } catch (e) { return []; }
 }
 
-// ── 13. Vidcore ────────────────────────────────────────────────────────
 async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var headers = { 'User-Agent': PLAYER_UA, Referer: API.vidcore + '/', 'X-Requested-With': 'XMLHttpRequest' };
@@ -1686,8 +1654,7 @@ async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
     var page = await _getText(baseUrl);
     var encM = page.match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
     if (!encM) return [];
-    var initRaw = await _getText(
-      MULTI_DECRYPT_API + '/enc-vidcore?text=' + encodeURIComponent(encM[1]));
+    var initRaw = await _getText(MULTI_DECRYPT_API + '/enc-vidcore?text=' + encodeURIComponent(encM[1]));
     var init = JSON.parse(initRaw).result;
     if (!init) return [];
     headers['X-CSRF-Token'] = init.token;
@@ -1715,7 +1682,7 @@ async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
           headers: headers, kind: 'raw'
         });
         (decStream.tracks || []).forEach(function (t) {
-          if (t.file && t.label) subtitleCb({ url: t.file, lang: t.label });
+          if (t.file && t.label && subtitleCb) subtitleCb({ url: t.file, lang: t.label });
         });
       } catch (e) {}
     }
@@ -1723,7 +1690,6 @@ async function _invokeVidcore(tmdbId, season, episode, subtitleCb) {
   } catch (e) { return []; }
 }
 
-// ── 14. Vidup ──────────────────────────────────────────────────────────
 async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
   if (!tmdbId) return [];
   var headers = { 'User-Agent': PLAYER_UA, Referer: API.vidup + '/', 'X-Requested-With': 'XMLHttpRequest' };
@@ -1734,8 +1700,7 @@ async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
     var page = await _getText(url);
     var encM = page.match(/\\"(?:en|token)\\":\\"(.*?)\\"/);
     if (!encM) return [];
-    var initRaw = await _getText(MULTI_DECRYPT_API + '/enc-vidup?text=' + encM[1], headers);
-    var parsed = JSON.parse(initRaw);
+    var parsed = JSON.parse(await _getText(MULTI_DECRYPT_API + '/enc-vidup?text=' + encM[1], headers));
     if (parsed.status !== 200 || !parsed.result) return [];
     var result = parsed.result;
     var postHeaders = Object.assign({}, headers, { 'X-CSRF-Token': result.token });
@@ -1754,8 +1719,7 @@ async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: streamEnc })
         });
-        var final = JSON.parse(finalRaw);
-        var stream = final && final.result;
+        var stream = (JSON.parse(finalRaw).result) || null;
         if (!stream || !stream.url) continue;
         out.push({
           url: stream.url, quality: '1080p',
@@ -1764,54 +1728,9 @@ async function _invokeVidup(tmdbId, season, episode, subtitleCb) {
           headers: { Referer: API.vidup + '/' }, kind: 'raw'
         });
         (stream.tracks || []).forEach(function (t) {
-          if (t.file && t.label) subtitleCb({ url: t.file, lang: t.label });
+          if (t.file && t.label && subtitleCb) subtitleCb({ url: t.file, lang: t.label });
         });
       } catch (e) {}
-    }
-    return out;
-  } catch (e) { return []; }
-}
-
-// ── 15. HubCloud ───────────────────────────────────────────────────────
-async function _resolveHubcloud(url) {
-  try {
-    var html = await _getText(url);
-    var m = html.match(/var\s+url\s*=\s*'([^']+)'/);
-    var link = null;
-    if (m) {
-      link = m[1];
-    } else {
-      var m2 = html.match(/var\s+url\s*=\s*atob\s*\(\s*atob\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\)/);
-      if (m2) {
-        try {
-          var inner = _b64ToBytes(m2[1]);
-          link = _bytesToStr(_b64ToBytes(_bytesToStr(inner)));
-        } catch (e) {}
-      }
-    }
-    if (!link) return [];
-    if (!/^https?:\/\//i.test(link)) {
-      var origin = url.match(/^(https?:\/\/[^\/]+)/);
-      if (origin) link = origin[1] + link;
-    }
-    var pageHtml = await _getText(link);
-    var header = (pageHtml.match(/card-header[^>]*>([^<]+)</i) || [])[1] || '';
-    var size = (pageHtml.match(/id=["']size["'][^>]*>([^<]+)</i) || [])[1] || '';
-    var quality = (header.match(/(\d{3,4})[pP]/) || [])[1] || 'Auto';
-    var out = [];
-    var re = /<a[^>]+href=["']([^"']+)["'][^>]*>([^<]*)<\/a>/gi;
-    var mm;
-    while ((mm = re.exec(pageHtml)) !== null) {
-      var href = mm[1], text = mm[2];
-      if (!href || !/https?:/i.test(href)) continue;
-      if (!/FSL|Mega Server|Download File|Buzz Server|pixeldra|Gofile/i.test(text)) continue;
-      out.push({
-        url: href,
-        quality: quality,
-        label: '[HubCloud] ' + text.replace(/<[^>]+>/g, '').trim() + (size ? ' [' + size + ']' : ''),
-        container: /\.m3u8/i.test(href) ? 'hls' : 'unknown',
-        headers: {}, kind: 'raw'
-      });
     }
     return out;
   } catch (e) { return []; }
@@ -1838,41 +1757,55 @@ var PROVIDER_REGISTRY = [
 ];
 
 // =============================================================================
-//  SOURCE ORCHESTRATION
+//  ORCHESTRATION
 // =============================================================================
 async function getVideoSources(episodeUrl, opts) {
   opts = opts || {};
   var parsed = _parseStreamId(episodeUrl);
-  if (!parsed.ids.length) return [];
+  if (!parsed.ids.length) {
+    console.warn('CineStream2: no ids parsed from episodeUrl:', episodeUrl);
+    return [];
+  }
 
   var cfg = _combinedSettings();
   var subs = [];
   var subtitleCb = function (s) { if (s && s.url) subs.push(s); };
 
-  // Enrich with Cinemeta so c.title / c.imdbId / c.tmdbId / c.year are set
-  var imdb = null;
-  for (var i = 0; i < parsed.ids.length; i++) {
-    if (/^tt\d+/.test(parsed.ids[i])) { imdb = parsed.ids[i]; break; }
-  }
+  // Prefer the URL over raw fields in case Zangetsu passed the episode object
   var ctx = {
-    title: null, imdbId: imdb, tmdbId: null, year: null,
-    season: parsed.season, episode: parsed.episode, subtitleCb: subtitleCb
+    title: null,
+    imdbId: null, tmdbId: null, year: null,
+    season: parsed.season, episode: parsed.episode,
+    subtitleCb: subtitleCb
   };
-  if (imdb) {
-    var meta = await _cinemetaMeta(parsed.type === 'series' ? 'series' : 'movie', imdb);
+
+  var parsedObj = null;
+  if (typeof episodeUrl === 'string' && episodeUrl.charAt(0) === '{') {
+    try { parsedObj = JSON.parse(episodeUrl); } catch (e) {}
+  } else if (episodeUrl && typeof episodeUrl === 'object') {
+    parsedObj = episodeUrl;
+  }
+  if (parsedObj) {
+    ctx.imdbId = parsedObj.imdbId || parsedObj.imdb_id || null;
+    ctx.tmdbId = parsedObj.tmdbId || parsedObj.tmdb_id || parsedObj.moviedb_id || null;
+  }
+
+  // Enrich from Cinemeta (title, year, tmdbId fallback)
+  if (ctx.imdbId) {
+    var meta = await _cinemetaMeta(parsed.type === 'series' ? 'series' : 'movie', ctx.imdbId);
     if (meta) {
       ctx.title = meta.name || (meta.aliases && meta.aliases[0]) || null;
-      ctx.tmdbId = meta.moviedb_id || null;
+      if (!ctx.tmdbId) ctx.tmdbId = meta.moviedb_id || null;
       ctx.year = _year(meta);
     }
   }
 
-  // Kick off every source in parallel
+  // Dispatch
   var jobs = [];
   for (var p = 0; p < PROVIDER_REGISTRY.length; p++) {
     (function (provider) {
       jobs.push(Promise.resolve(provider.run(ctx)).catch(function (e) {
-        console.warn('fail', provider.key, String(e));
+        console.warn('provider fail', provider.key, String(e));
         return [];
       }));
     })(PROVIDER_REGISTRY[p]);
@@ -1881,9 +1814,8 @@ async function getVideoSources(episodeUrl, opts) {
     jobs.push(_queryAddon(base, parsed, subtitleCb).catch(function () { return []; }));
   });
 
-  // Wyzie subtitles
-  if (cfg.wyzieKey && imdb) {
-    _invokeWyzieSubs(imdb, parsed.season, parsed.episode, subtitleCb);
+  if (cfg.wyzieKey && ctx.imdbId) {
+    _invokeWyzieSubs(ctx.imdbId, parsed.season, parsed.episode, subtitleCb);
   }
 
   var lists = await Promise.all(jobs);
@@ -1897,16 +1829,19 @@ async function getVideoSources(episodeUrl, opts) {
     });
   });
 
-  // Flush subtitles
   if (typeof opts.onSubtitle === 'function') {
     var subSeen = new Set();
     subs.forEach(function (s) {
-      if (!subSeen.has(s.url)) {
-        subSeen.add(s.url);
-        opts.onSubtitle(s);
-      }
+      if (!subSeen.has(s.url)) { subSeen.add(s.url); opts.onSubtitle(s); }
+    });
+  } else if (typeof opts.subtitleCallback === 'function') {
+    var subSeen2 = new Set();
+    subs.forEach(function (s) {
+      if (!subSeen2.has(s.url)) { subSeen2.add(s.url); opts.subtitleCallback(s); }
     });
   }
+
+  console.log('CineStream2: produced', out.length, 'streams for', ctx.title || ctx.imdbId || ctx.tmdbId);
   return out;
 }
 
@@ -1918,7 +1853,7 @@ function getLinks(id, opts)   { return getVideoSources(id, opts); }
 // =============================================================================
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    version: '1.0.0',
+    version: '1.0.1',
     getInfo: getInfo,
     getSettings: getSettings,
     getHome: getHome,
@@ -1936,6 +1871,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _parseStreamId: _parseStreamId,
     _parseDetailUrl: _parseDetailUrl,
     _episodeUrl: _episodeUrl,
+    _tmdbUrl: _tmdbUrl,
     _combinedSettings: _combinedSettings,
     _toZangetsuStream: _toZangetsuStream,
     _invokeCastle: _invokeCastle,
