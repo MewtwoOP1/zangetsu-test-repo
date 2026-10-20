@@ -1,23 +1,71 @@
-name: Test CineStream2 Provider
+name: Test CineStream2
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+    paths:
+      - 'providers/cinestream2.js'
+      - 'tests/**'
+      - 'index.json'
+      - '.github/workflows/test.yml'
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: Provider smoke tests
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20' # Use a stable LTS version[reference:0]
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-    - name: Run tests
-      run: node test-cinestream2.js
+      - name: Validate index.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            if (!fs.existsSync('index.json')) {
+              console.error('❌ index.json missing');
+              process.exit(1);
+            }
+            const json = JSON.parse(fs.readFileSync('index.json', 'utf8'));
+            if (!Array.isArray(json.sources)) {
+              console.error('❌ index.json has no sources[] array');
+              process.exit(1);
+            }
+            const cs = json.sources.find(s => s.id === 'cinestream2');
+            if (!cs) {
+              console.error('❌ cinestream2 not registered in index.json');
+              process.exit(1);
+            }
+            if (!fs.existsSync(cs.file)) {
+              console.error('❌ Provider file missing: ' + cs.file);
+              process.exit(1);
+            }
+            console.log('✅ index.json valid — cinestream2 v' + cs.version);
+            console.log('   File: ' + cs.file);
+          "
+
+      - name: Syntax check provider
+        run: |
+          node --check providers/cinestream2.js
+          echo "✅ providers/cinestream2.js syntax OK"
+
+      - name: Run provider tests
+        run: node tests/cinestream2.test.js
+
+      - name: Print summary
+        if: always()
+        run: |
+          echo "::notice title=Test Summary::${{ job.status == 'success' && 'All tests passed ✅' || 'Some tests failed ❌ — check the logs above' }}"
