@@ -1,10 +1,10 @@
 {
   "name": "MewtwoOP1's Zangetsu Experiments",
   "description": "Personal playground for experimental Zangetsu JS providers. Expect breakage.",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "iconUrl": "https://www.google.com/s2/favicons?sz=256&domain=github.com",
   "repositoryUrl": "https://github.com/MewtwoOP1/Zangetsu-experiment",
-  "changelog": "0.1.0 — initial experiment repo with cinestream2",
+  "changelog": "1.0.1 — initial experiment repo with cinestream2",
   "sources": [
     {
       "id": "cinestream2",
