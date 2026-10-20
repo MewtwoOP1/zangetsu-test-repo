@@ -1,22 +1,48 @@
 // =============================================================================
 //  cinestream2.js — CineStream2 for Zangetsu
-//  v2.1.0 — Updated domains, added provider toggle checkboxes, fixed APIs
+//  v2.1.1 — Added atob/btoa polyfills for QuickJS-NG, wrapped all providers
 // =============================================================================
 
 var SOURCE_ID = (typeof __SOURCE_ID !== 'undefined' && __SOURCE_ID) ? String(__SOURCE_ID) : 'cinestream2';
 
-// ── Updated Endpoints ───────────────────────────────────────────────────
+// ── Polyfills for QuickJS-NG ────────────────────────────────────────────
+// Zangetsu's JS engine does not always include atob/btoa. We define them here.
+var _b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+var _btoa = (typeof btoa !== 'undefined') ? btoa : function(input) {
+    var str = String(input);
+    var output = '';
+    for (var block, charCode, idx = 0, map = _b64chars;
+         str.charAt(idx | 0) || (map = '=', idx % 1);
+         output += map.charAt(63 & block >> 8 - idx % 1 * 8)) {
+        charCode = str.charCodeAt(idx += 3 / 4);
+        if (charCode > 0xFF) throw new Error("'btoa' failed: The string contains characters outside of the Latin1 range.");
+        block = block << 8 | charCode;
+    }
+    return output;
+};
+var _atob = (typeof atob !== 'undefined') ? atob : function(input) {
+    var str = String(input).replace(/=+$/, '');
+    if (str.length % 4 == 1) throw new Error("'atob' failed: The string is not correctly encoded.");
+    for (var bc = 0, bs, buffer, idx = 0, output = '';
+         buffer = str.charAt(idx++);
+         ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+        buffer = _b64chars.indexOf(buffer);
+    }
+    return output;
+};
+
+// ── Endpoints ───────────────────────────────────────────────────────────
 var CINEMETA = "https://v3-cinemeta.strem.io";
 var TMDB_API = "https://api.themoviedb.org/3";
 var TMDB_IMG = "https://image.tmdb.org/t/p";
 var VA_PLAYER = "https://streamdata.vaplayer.ru";
-var VIDROCK = "https://vidrock.to"; // Updated from .ru
+var VIDROCK = "https://vidrock.to";
 var VIDZEE = "https://player.vidzee.wtf";
 var MULTI_DECRYPT = "https://enc-dec.app/api";
 var SHOWBOX = "https://showbox.media";
 var FEBBOX = "https://www.febbox.com";
-var ANIKOTO_API = "https://anikotoapi.fampep.workers.dev"; // Updated to API endpoint
-var KISSKH = "https://kisskh.is"; // Updated from .nl
+var ANIKOTO_API = "https://anikotoapi.fampep.workers.dev";
+var KISSKH = "https://kisskh.is";
 var ANIMESALT = "https://animesalt.ac";
 var VIDFAST = "https://vidfast.vc";
 var HEXA = "https://theemoviedb.hexa.su";
@@ -33,7 +59,7 @@ function getInfo() {
         name: 'CineStream2', lang: 'en',
         baseUrl: 'https://www.themoviedb.org',
         logo: 'https://www.google.com/s2/favicons?sz=256&domain=strem.io',
-        type: 'movie', version: '2.1.0'
+        type: 'movie', version: '2.1.1'
     };
 }
 
@@ -41,7 +67,6 @@ function getSettings() {
     return [
         { key: 'tmdbApiKey', label: 'TMDB API Key (optional)', description: 'Required for TMDB catalog items.', type: 'text', default: '' },
         { key: 'showboxToken', label: 'Showbox (Febbox) UI Token', description: 'Required for Showbox.', type: 'text', default: '' },
-        // Toggles for each provider
         { key: 'enableVaPlayer', label: 'Enable VaPlayer', type: 'bool', default: true },
         { key: 'enableVidrock', label: 'Enable Vidrock', type: 'bool', default: true },
         { key: 'enableVidzee', label: 'Enable Vidzee', type: 'bool', default: true },
@@ -120,7 +145,7 @@ async function fetchJson(url, opts) {
 
 function base64ToBytes(b64) {
     try {
-        var bin = atob(b64);
+        var bin = _atob(b64);
         var bytes = new Uint8Array(bin.length);
         for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         return bytes;
@@ -136,7 +161,7 @@ function base64UrlToBytes(s) {
 function bytesToBase64Url(b) {
     var bin = '';
     for (var i = 0; i < b.length; i++) bin += String.fromCharCode(b[i]);
-    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    return _btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
 function slugify(text) {
@@ -149,7 +174,7 @@ function slugify(text) {
 // =============================================================================
 async function decryptVidzeeUrl(encryptedUrl, secret) {
     try {
-        var decodedString = atob(encryptedUrl);
+        var decodedString = _atob(encryptedUrl);
         var parts = decodedString.split(":");
         if (parts.length < 2) return null;
         var iv = base64ToBytes(parts[0]);
@@ -412,7 +437,8 @@ async function getVidrock(tmdbId, season, episode, subCallback) {
 
 async function getVidzee(tmdbId, season, episode, subCallback) {
     if (!tmdbId) return [];
-    var secret = atob("QTdrUDl4TTJRdjhMcjROejFIdDZZYzNCdzVKZjBEc1U=");
+    // Use safe polyfill instead of native atob
+    var secret = _atob("QTdrUDl4TTJRdjhMcjROejFIdDZZYzNCdzVKZjBEc1U=");
     var defaultReferer = VIDZEE + "/";
     var servers = [0, 1, 2, 4, 5, 6, 7];
     var out = [];
@@ -503,7 +529,6 @@ async function getAnikoto(title, year, episode, subCallback) {
     if (!title) return [];
     var headers = { "referer": "https://anikototv.to/", "x-requested-with": "XMLHttpRequest" };
     try {
-        // Use the dedicated API endpoint
         var filterHtml = await fetchText(ANIKOTO_API + "/filter?keyword=" + encodeURIComponent(title) + "&type=&year%5B%5D=" + (year||"") + "&ep_min=&ep_max=&sort=default");
         var dataTipMatch = filterHtml.match(/class="tip ani"[^>]*data-tip="([^"]+)"/);
         if (!dataTipMatch) return [];
@@ -552,7 +577,6 @@ async function getKissKH(title, year, season, episode, subCallback) {
     if (!title) return [];
     try {
         var type = season == null ? "2" : "1";
-        // Updated domain to kisskh.is
         var searchRes = JSON.parse(await fetchText(KISSKH + "/api/DramaList/Search?q=" + encodeURIComponent(title) + "&type=" + type, { "Referer": KISSKH + "/" }));
         if (!searchRes || !searchRes.length) return [];
         
@@ -684,7 +708,7 @@ async function getCinejoy(title, imdbId, tmdbId, year, season, episode, subCallb
 }
 
 // =============================================================================
-//  ORCHESTRATOR (with Toggles)
+//  ORCHESTRATOR
 // =============================================================================
 async function getVideoSources(episodeUrl, opts) {
     opts = opts || {};
@@ -696,18 +720,21 @@ async function getVideoSources(episodeUrl, opts) {
     var subCallback = function(s) { if (s && s.url) subs.push(s); };
     
     var tasks = [];
-    if (_bool('enableVaPlayer', true)) tasks.push(getVaPlayer(meta.imdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableVidrock', true)) tasks.push(getVidrock(meta.tmdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableVidzee', true)) tasks.push(getVidzee(meta.tmdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableShowbox', false)) tasks.push(getShowbox(meta.imdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableVidfast', true)) tasks.push(getVidfast(meta.tmdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableHexa', true)) tasks.push(getHexa(meta.tmdbId, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableCinejoy', true)) tasks.push(getCinejoy(meta.title, meta.imdbId, meta.tmdbId, meta.year, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableAnikoto', true)) tasks.push(getAnikoto(meta.title, meta.year, parsed.episode, subCallback));
-    if (_bool('enableKissKH', true)) tasks.push(getKissKH(meta.title, meta.year, parsed.season, parsed.episode, subCallback));
-    if (_bool('enableAnimeSalt', true)) tasks.push(getAnimesalt(meta.title, parsed.season, parsed.episode, subCallback));
+    // Wrap every provider in a safe executor so one crash doesn't break the rest
+    var safe = function(fn) { return withTimeout(fn, 15000, []).catch(function() { return []; }); };
     
-    var results = await Promise.all(tasks.map(function(t) { return withTimeout(t, 15000, []); }));
+    if (_bool('enableVaPlayer', true)) tasks.push(safe(getVaPlayer(meta.imdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableVidrock', true)) tasks.push(safe(getVidrock(meta.tmdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableVidzee', true)) tasks.push(safe(getVidzee(meta.tmdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableShowbox', false)) tasks.push(safe(getShowbox(meta.imdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableVidfast', true)) tasks.push(safe(getVidfast(meta.tmdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableHexa', true)) tasks.push(safe(getHexa(meta.tmdbId, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableCinejoy', true)) tasks.push(safe(getCinejoy(meta.title, meta.imdbId, meta.tmdbId, meta.year, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableAnikoto', true)) tasks.push(safe(getAnikoto(meta.title, meta.year, parsed.episode, subCallback)));
+    if (_bool('enableKissKH', true)) tasks.push(safe(getKissKH(meta.title, meta.year, parsed.season, parsed.episode, subCallback)));
+    if (_bool('enableAnimeSalt', true)) tasks.push(safe(getAnimesalt(meta.title, parsed.season, parsed.episode, subCallback)));
+    
+    var results = await Promise.all(tasks);
     
     var out = [];
     var seen = {};
@@ -738,7 +765,7 @@ function getLinks(id, opts) { return getVideoSources(id, opts); }
 // =============================================================================
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-        version: '2.1.0',
+        version: '2.1.1',
         getInfo: getInfo,
         getSettings: getSettings,
         getHome: getHome,
