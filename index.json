@@ -9,7 +9,7 @@
     {
       "id": "cinestream2",
       "name": "CineStream2",
-      "version": "1.4.1",
+      "version": "1.4.3",
       "type": "movie",
       "lang": "en",
       "file": "providers/cinestream2.js",
